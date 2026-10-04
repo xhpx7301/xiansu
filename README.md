@@ -76,9 +76,13 @@ sudo systemctl restart adaptive-traffic.service
 4. 重启服务并应用配置
 5. 查看实时 systemd 日志
 6. 查看网卡和 `tc` 限速统计
-7. 编辑 `/etc/adaptive-traffic/config.env`
+7. 配置管理二级菜单：限速策略、恢复条件、流量补充、下载限速
 8. 从 GitHub 获取最新脚本并自动重启服务
 9. 卸载服务、脚本和 `xs` 快捷命令
+
+配置管理中的“编辑完整原始配置”仍可打开 `/etc/adaptive-traffic/config.env`，适合修改高级参数；常用配置建议通过二级菜单修改，保存后会自动校验并在服务运行时重启应用。
+
+“查看 `tc` 限速统计”会将内核队列输出整理为中文，显示网卡、队列类型、当前限速、突发额度、队列延迟、累计发送量、数据包、丢包、超限次数和队列积压。
 
 更新功能只替换脚本，不会覆盖 `/etc/adaptive-traffic/config.env`、统计状态或日志。也可以直接执行：
 

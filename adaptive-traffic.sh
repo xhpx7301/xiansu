@@ -67,7 +67,7 @@ EOF
     DOWNLOAD_RX_FRACTION="${DOWNLOAD_RX_FRACTION:-1.333333}"
     MAX_DOWNLOAD_BYTES_PER_HOUR="${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}"
     DOWNLOAD_URL="${DOWNLOAD_URL:-}"
-    DOWNLOAD_RATE_LIMIT="${DOWNLOAD_RATE_LIMIT:-5000000}"
+    DOWNLOAD_RATE_LIMIT="${DOWNLOAD_RATE_LIMIT-5000000}"
     DOWNLOAD_TIMEOUT_SECONDS="${DOWNLOAD_TIMEOUT_SECONDS:-1800}"
 }
 
@@ -180,11 +180,12 @@ format_bytes() {
 
 show_dashboard() {
     load_config
-    local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text
-    local blue='' green='' yellow='' cyan='' dim='' reset=''
+    local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color
+    local blue='' green='' red='' yellow='' cyan='' magenta='' dim='' reset=''
     if [ -t 1 ]; then
-        blue=$'\033[1;34m'; green=$'\033[1;32m'; yellow=$'\033[1;33m'
-        cyan=$'\033[1;36m'; dim=$'\033[0;37m'; reset=$'\033[0m'
+        blue=$'\033[1;34m'; green=$'\033[1;32m'; red=$'\033[1;31m'
+        yellow=$'\033[1;33m'; cyan=$'\033[1;36m'; magenta=$'\033[1;35m'
+        dim=$'\033[0;37m'; reset=$'\033[0m'
     fi
 
     iface="$(detect_iface 2>/dev/null || true)"
@@ -218,21 +219,23 @@ show_dashboard() {
         rate_label="${rate} Mbps"
     fi
     [ "$DIRECTION" = both ] && direction_text="双向" || direction_text="出站"
-    [ "$DOWNLOAD_ENABLED" = true ] && download_state="已开启" || download_state="已关闭"
+    if [ "$service_state" = active ]; then service_color="$green"; else service_color="$red"; fi
+    if [ "$DOWNLOAD_ENABLED" = true ]; then download_state="已开启"; download_color="$green"; else download_state="已关闭"; download_color="$dim"; fi
+    if [ "$gap" -eq 0 ]; then gap_color="$green"; else gap_color="$red"; fi
 
     printf '%s=== 自适应限速与流量管理 v%s ===%s\n' "$blue" "$SCRIPT_VERSION" "$reset"
     printf '%s服务：%s%-10s%s | 网卡：%s%-12s%s | 限速方向：%s%s%s\n' \
-        "$dim" "$green" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
+        "$dim" "$service_color" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
     printf '当前限速：%s%s%s | 活跃计时：%ss | 阶段：%s\n' \
-        "$yellow" "$rate_label" "$reset" "$active_seconds" "$RATE_STAGES"
-    printf '恢复条件：低于 %s Mbps 持续 %ss | 当前小时 (UTC)：%s\n' \
-        "$RECOVERY_RATE_MBPS" "$RECOVERY_SECONDS" "$hour"
-    printf '%s整机流量：%s | 入站(RX)：%s | 出站(TX)：%s | 入/出：%s%s\n' \
-        "$green" "$iface" "$(format_bytes "$hour_rx")" "$(format_bytes "$hour_tx")" "$ratio" "$reset"
-    printf '目标入站：出站 × %s = %s | 待补缺口：%s\n' \
-        "$DOWNLOAD_RX_FRACTION" "$(format_bytes "$target")" "$(format_bytes "$gap")"
-    printf '补充下载：%s | 速率上限：%s Mbps | 来源：腾讯镜像\n' \
-        "$download_state" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')"
+        "$magenta" "$rate_label" "$reset" "$active_seconds" "$RATE_STAGES"
+    printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前小时 (UTC)：%s%s%s\n' \
+        "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$hour" "$reset"
+    printf '%s整机流量：%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
+        "$dim" "$iface" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
+    printf '目标入站：出站 × %s%s%s = %s%s%s | 待补缺口：%s%s%s\n' \
+        "$magenta" "$DOWNLOAD_RX_FRACTION" "$reset" "$cyan" "$(format_bytes "$target")" "$reset" "$gap_color" "$(format_bytes "$gap")" "$reset"
+    printf '补充下载：%s%s%s | 速率上限：%s%s Mbps%s | 来源：%s腾讯镜像%s\n' \
+        "$download_color" "$download_state" "$reset" "$yellow" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')" "$reset" "$blue" "$reset"
     printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
 }
 
@@ -433,13 +436,44 @@ show_tc_status() {
     local iface
     iface="$(detect_iface)" || return 1
     [ -n "$iface" ] || die "无法检测默认路由网卡"
-    echo "网卡：$iface"
-    tc -s qdisc show dev "$iface"
+    show_one_tc_stats "$iface" "出站网卡"
     if [ "$DIRECTION" = both ] && ip link show ifb-at >/dev/null 2>&1; then
         echo
-        echo "IFB 入站整形：ifb-at"
-        tc -s qdisc show dev ifb-at
+        show_one_tc_stats ifb-at "入站整形 IFB"
     fi
+}
+
+show_one_tc_stats() {
+    local iface="$1" label="$2" raw kind handle rate burst latency bytes packets drops overlimits backlog
+    echo "[$label：$iface]"
+    raw="$(tc -s qdisc show dev "$iface" 2>/dev/null || true)"
+    if [ -z "$raw" ]; then
+        echo "  未发现流量队列规则。"
+        return 0
+    fi
+    while IFS=$'\t' read -r kind handle rate burst latency bytes packets drops overlimits backlog; do
+        [ -n "$kind" ] || continue
+        case "$kind" in
+            tbf) kind="TBF 令牌桶" ;;
+            fq_codel) kind="FQ-CoDel 公平队列" ;;
+            fq) kind="FQ 公平队列" ;;
+            pfifo_fast) kind="PFIFO_FAST 先进先出" ;;
+            noqueue) kind="无队列" ;;
+            *) kind="$kind 队列" ;;
+        esac
+        printf '  队列类型：%s（句柄 %s）\n' "$kind" "$handle"
+        if [ -n "$rate" ]; then printf '  限速速率：%s\n' "$rate"; else echo '  限速速率：队列未声明固定速率'; fi
+        [ -n "$burst" ] && printf '  突发额度：%s\n' "$burst"
+        [ -n "$latency" ] && printf '  队列延迟：%s\n' "$latency"
+        printf '  累计发送：%s | 数据包：%s\n' "$(format_bytes "${bytes:-0}")" "${packets:-0}"
+        printf '  丢包：%s | 超限次数：%s | 当前积压：%s\n' "${drops:-0}" "${overlimits:-0}" "${backlog:-0}"
+    done < <(printf '%s\n' "$raw" | awk '
+        function emit() { if (kind != "") print kind "\t" handle "\t" rate "\t" burst "\t" latency "\t" bytes "\t" packets "\t" drops "\t" overlimits "\t" backlog }
+        /^qdisc / { kind=$2; handle=$3; rate=""; burst=""; latency=""; bytes=0; packets=0; drops=0; overlimits=0; backlog="0b"; for (i=1;i<=NF;i++) {if ($i=="rate") rate=$(i+1); if ($i=="burst") burst=$(i+1); if ($i=="lat") latency=$(i+1)} }
+        /^ Sent / { for (i=1;i<=NF;i++) {if ($i=="Sent") bytes=$(i+1); if ($i=="pkt") packets=$(i-1); if ($i ~ /dropped/) {v=$(i+1); gsub(/[(),]/,"",v); drops=v} if ($i=="overlimits") {v=$(i+1); gsub(/[(),]/,"",v); overlimits=v}} }
+        /^ backlog / {backlog=$2; emit(); kind=""}
+        END {emit()}
+    ')
 }
 
 edit_config() {
@@ -450,6 +484,142 @@ edit_config() {
         if have nano; then editor=nano; elif have vi; then editor=vi; else die "未找到 nano 或 vi"; fi
     fi
     "$editor" "$CONFIG_FILE"
+}
+
+set_config_value() {
+    local key="$1" rhs="$2" temp_file
+    temp_file="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
+    awk -F= -v key="$key" -v rhs="$rhs" '$1 == key {print key "=" rhs; found=1; next} {print} END {if (!found) print key "=" rhs}' "$CONFIG_FILE" > "$temp_file"
+    chmod 600 "$temp_file"
+    mv "$temp_file" "$CONFIG_FILE"
+    load_config
+    validate_config
+    if systemctl is-active --quiet adaptive-traffic.service 2>/dev/null; then
+        systemctl restart adaptive-traffic.service
+        echo "配置已保存，服务已重启应用。"
+    else
+        echo "配置已保存；服务当前未运行，启动或重启服务后生效。"
+    fi
+}
+
+configure_one() {
+    local key="$1" title="$2" current value rhs
+    current="${!key:-}"
+    read -r -p "$title [$current]: " value
+    [ -n "$value" ] || { echo "未修改。"; return 0; }
+    rhs="$value"
+    case "$key" in
+        IFACE)
+            if [ "$value" = auto ]; then
+                rhs='""'
+            else
+                [[ "$value" =~ ^[A-Za-z0-9_.:-]+$ ]] || { echo "网卡名称格式无效。"; return 1; }
+                ip link show dev "$value" >/dev/null 2>&1 || { echo "网卡不存在：$value"; return 1; }
+                rhs="\"$value\""
+            fi
+            ;;
+        RATE_STAGES)
+            [[ "$value" =~ ^[0-9]+([.][0-9]+)?:[0-9]+(,[0-9]+([.][0-9]+)?:[0-9]+)*$ ]] || { echo '格式示例：160:15,80:15,40:0'; return 1; }
+            RATE_STAGES="$value"
+            validate_config || return 1
+            rhs="\"$value\""
+            ;;
+        RECOVERY_RATE_MBPS|DOWNLOAD_RX_FRACTION)
+            [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "请输入非负数字。"; return 1; }
+            if [ "$key" = DOWNLOAD_RX_FRACTION ]; then
+                awk -v x="$value" 'BEGIN {exit !(x <= 10)}' || { echo "比例最大为 10。"; return 1; }
+            fi
+            ;;
+        RECOVERY_SECONDS|MAX_DOWNLOAD_BYTES_PER_HOUR)
+            [[ "$value" =~ ^[0-9]+$ ]] || { echo "请输入非负整数。"; return 1; }
+            [ "$key" != RECOVERY_SECONDS ] || [ "$value" -gt 0 ] || { echo "恢复秒数必须大于 0。"; return 1; }
+            ;;
+        DIRECTION)
+            [[ "$value" == egress || "$value" == both ]] || { echo "请输入 egress 或 both。"; return 1; }
+            rhs="\"$value\""
+            ;;
+        DOWNLOAD_ENABLED)
+            [[ "$value" == true || "$value" == false ]] || { echo "请输入 true 或 false。"; return 1; }
+            ;;
+        DOWNLOAD_RATE_LIMIT)
+            [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "请输入 Mbps 数字；输入 0 表示不限速。"; return 1; }
+            if awk -v x="$value" 'BEGIN {exit !(x == 0)}'; then rhs='""'; else rhs="\"$(awk -v mbps="$value" 'BEGIN {printf "%.0f", mbps*1000000/8}')\""; fi
+            ;;
+        DOWNLOAD_URL)
+            [[ "$value" == https://* ]] || { echo "请输入 https:// 开头的 URL。"; return 1; }
+            rhs="\"$value\""
+            ;;
+        *) echo "不支持修改此配置项。"; return 1 ;;
+    esac
+    set_config_value "$key" "$rhs"
+}
+
+config_submenu() {
+    local category choice
+    while true; do
+        clear 2>/dev/null || true
+        load_config
+        echo "========== 配置管理 =========="
+        echo "  1. 限速策略与网卡"
+        echo "  2. 不对等流量补充"
+        echo "  3. 编辑完整原始配置"
+        echo "  0. 返回主菜单"
+        echo
+        read -r -p "请选择 [0-3]: " category
+        case "$category" in
+            1)
+                while true; do
+                    clear 2>/dev/null || true
+                    load_config
+                    echo "====== 限速策略与网卡 ======"
+                    echo "  1. 网卡（当前：${IFACE:-自动检测}）"
+                    echo "  2. 分阶段速率（当前：$RATE_STAGES）"
+                    echo "  3. 恢复阈值（当前：$RECOVERY_RATE_MBPS Mbps）"
+                    echo "  4. 恢复等待（当前：$RECOVERY_SECONDS 秒）"
+                    echo "  5. 限速方向（当前：$DIRECTION）"
+                    echo "  0. 返回配置菜单"
+                    read -r -p "请选择 [0-5]: " choice
+                    case "$choice" in
+                        1) configure_one IFACE "网卡名（输入 auto 自动检测）"; pause_menu ;;
+                        2) configure_one RATE_STAGES "分阶段速率 Mbps:秒数"; pause_menu ;;
+                        3) configure_one RECOVERY_RATE_MBPS "低于该吞吐率时开始恢复计时 (Mbps)"; pause_menu ;;
+                        4) configure_one RECOVERY_SECONDS "低速持续多少秒后恢复"; pause_menu ;;
+                        5) configure_one DIRECTION "输入 egress 或 both"; pause_menu ;;
+                        0) break ;;
+                        *) echo "无效选项"; sleep 1 ;;
+                    esac
+                done
+                ;;
+            2)
+                while true; do
+                    clear 2>/dev/null || true
+                    load_config
+                    local rate_mbps
+                    rate_mbps="$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.2f", bytes*8/1000000; else printf "0 (不限速)"}')"
+                    echo "====== 不对等流量补充 ======"
+                    echo "  1. 自动补充开关（当前：$DOWNLOAD_ENABLED）"
+                    echo "  2. 入站/出站目标比例（当前：$DOWNLOAD_RX_FRACTION）"
+                    echo "  3. 每小时最大补充量（当前：$MAX_DOWNLOAD_BYTES_PER_HOUR bytes；0 为不限）"
+                    echo "  4. 下载速度上限（当前：$rate_mbps Mbps；0 为不限）"
+                    echo "  5. 腾讯镜像下载 URL"
+                    echo "  0. 返回配置菜单"
+                    read -r -p "请选择 [0-5]: " choice
+                    case "$choice" in
+                        1) configure_one DOWNLOAD_ENABLED "启用自动下载补足？输入 true 或 false"; pause_menu ;;
+                        2) configure_one DOWNLOAD_RX_FRACTION "目标入站/出站比例（1.333333 表示多三分之一）"; pause_menu ;;
+                        3) configure_one MAX_DOWNLOAD_BYTES_PER_HOUR "每小时最大下载字节数（0 为不限）"; pause_menu ;;
+                        4) configure_one DOWNLOAD_RATE_LIMIT "下载限速 Mbps（40 表示 40 Mbps，0 为不限）"; pause_menu ;;
+                        5) configure_one DOWNLOAD_URL "下载 URL"; pause_menu ;;
+                        0) break ;;
+                        *) echo "无效选项"; sleep 1 ;;
+                    esac
+                done
+                ;;
+            3) edit_config; load_config; validate_config; pause_menu ;;
+            0) return 0 ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
 }
 
 service_action() {
@@ -471,7 +641,7 @@ show_menu() {
         echo "  4. 重启服务并应用配置"
         echo "  5. 查看实时服务日志"
         echo "  6. 查看 tc 限速统计"
-        echo "  7. 编辑配置文件"
+        echo "  7. 配置管理（二级菜单）"
         echo "  8. 从 GitHub 获取最新脚本"
         echo "  9. 卸载服务和 xs 快捷命令"
         echo "  0. 退出"
@@ -484,7 +654,7 @@ show_menu() {
             4) service_action restart || true; pause_menu ;;
             5) journalctl -u adaptive-traffic.service -f || true ;;
             6) show_tc_status || true; pause_menu ;;
-            7) edit_config; echo "配置已编辑，选择 4 重启服务后生效。"; pause_menu ;;
+            7) config_submenu ;;
             8) update_script; exec "$INSTALL_PATH" menu ;;
             9) uninstall_service; echo "卸载完成。"; return 0 ;;
             0) return 0 ;;
