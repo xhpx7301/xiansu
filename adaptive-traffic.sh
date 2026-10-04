@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.2"
+readonly SCRIPT_VERSION="1.2.3"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -324,7 +324,7 @@ run() {
 }
 
 install_script_file() {
-    local source_script="${BASH_SOURCE[0]:-}" temp_file
+    local source_script="${BASH_SOURCE[0]:-}" temp_file fetch_url
     mkdir -p "$(dirname "$INSTALL_PATH")"
 
     if [ -f "$source_script" ] && [[ "$source_script" != /dev/fd/* ]]; then
@@ -336,7 +336,8 @@ install_script_file() {
         fi
     else
         temp_file="$(mktemp)"
-        if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$temp_file"; then
+        fetch_url="${SCRIPT_URL}?_=$(date +%s)"
+        if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 15 --max-time 120 "$fetch_url" -o "$temp_file"; then
             rm -f "$temp_file"
             die "无法从 GitHub 下载最新脚本：$SCRIPT_URL"
         fi
@@ -386,10 +387,11 @@ install_service() {
 update_script() {
     need_root
     have curl || die "更新需要 curl"
-    local temp_file remote_version current_version
+    local temp_file remote_version current_version fetch_url
     temp_file="$(mktemp)"
     echo "正在从 GitHub 获取最新脚本..."
-    if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$temp_file"; then
+    fetch_url="${SCRIPT_URL}?_=$(date +%s)"
+    if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 15 --max-time 120 "$fetch_url" -o "$temp_file"; then
         rm -f "$temp_file"
         die "下载失败：$SCRIPT_URL"
     fi
