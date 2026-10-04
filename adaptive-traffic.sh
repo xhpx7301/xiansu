@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.3"
+readonly SCRIPT_VERSION="1.2.4"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -278,7 +278,7 @@ run() {
     have awk || die "缺少 awk"
     have curl || die "缺少 curl"
     load_config; validate_config
-    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour last_download_check=0
+    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour last_download_check=0 last_state_seconds=-1
     iface="$(detect_iface)"; [ -n "$iface" ] || die "无法检测默认路由网卡"
     echo "$$" > "$PID_FILE"
     trap 'cleanup_tc "$iface"; state_set CURRENT_RATE none; state_set ACTIVE_SECONDS 0; rm -f "$PID_FILE"' EXIT
@@ -305,9 +305,14 @@ run() {
             apply_rate "$iface" "$current_rate"
             APPLIED_RATE="$current_rate"
             state_set CURRENT_RATE "$current_rate"
-            state_set ACTIVE_SECONDS "$elapsed"
             log "应用限速：${current_rate} Mbps（活跃 ${elapsed}s）"
         fi
+        if [ "$elapsed" -ne "$last_state_seconds" ] && { [ $((elapsed % 5)) -eq 0 ] || [ "$current_rate" != "${APPLIED_RATE_BEFORE:-}" ]; }; then
+            state_set CURRENT_RATE "$current_rate"
+            state_set ACTIVE_SECONDS "$elapsed"
+            last_state_seconds="$elapsed"
+        fi
+        APPLIED_RATE_BEFORE="$current_rate"
         hour="$(date -u +%Y%m%d%H)"
         if [ "$(state_get HOUR 0)" != "$hour" ]; then
             state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"
@@ -501,6 +506,16 @@ set_config_value() {
     local key="$1" rhs="$2" temp_file
     temp_file="$(mktemp "$CONFIG_DIR/config.XXXXXX")"
     awk -F= -v key="$key" -v rhs="$rhs" '$1 == key {print key "=" rhs; found=1; next} {print} END {if (!found) print key "=" rhs}' "$CONFIG_FILE" > "$temp_file"
+    if ! bash -n "$temp_file" 2>/dev/null; then
+        rm -f "$temp_file"
+        echo "配置文件语法校验失败，未保存。" >&2
+        return 1
+    fi
+    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.333333}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
+        rm -f "$temp_file"
+        echo "配置值校验失败，未保存。" >&2
+        return 1
+    fi
     chmod 600 "$temp_file"
     mv "$temp_file" "$CONFIG_FILE"
     load_config
@@ -626,7 +641,16 @@ config_submenu() {
                     esac
                 done
                 ;;
-            3) edit_config; load_config; validate_config; pause_menu ;;
+            3)
+                edit_config
+                load_config
+                if validate_config; then
+                    echo "配置校验通过。"
+                else
+                    echo "配置校验失败：服务不会应用当前无效配置，请修正后再重启。"
+                fi
+                pause_menu
+                ;;
             0) return 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac
