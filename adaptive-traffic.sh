@@ -41,8 +41,8 @@ RECOVERY_RATE_MBPS=5
 RECOVERY_SECONDS=30
 # egress 只限制出站；both 同时把入站导入 IFB 后限速
 DIRECTION="egress"
-# 是否按小时补充入站流量。false 时只统计和限速
-DOWNLOAD_ENABLED=false
+# 是否按小时补充入站流量。默认开启；false 时只统计和限速
+DOWNLOAD_ENABLED=true
 # 目标为：每小时入站比出站多三分之一，即入站至少达到出站的 4/3
 DOWNLOAD_RX_FRACTION=1.333333
 # 每小时下载上限，0 表示不设上限；不设上限才能在高流量时完成 4/3 目标
@@ -63,7 +63,7 @@ EOF
     RECOVERY_RATE_MBPS="${RECOVERY_RATE_MBPS:-5}"
     RECOVERY_SECONDS="${RECOVERY_SECONDS:-30}"
     DIRECTION="${DIRECTION:-egress}"
-    DOWNLOAD_ENABLED="${DOWNLOAD_ENABLED:-false}"
+    DOWNLOAD_ENABLED="${DOWNLOAD_ENABLED:-true}"
     DOWNLOAD_RX_FRACTION="${DOWNLOAD_RX_FRACTION:-1.333333}"
     MAX_DOWNLOAD_BYTES_PER_HOUR="${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}"
     DOWNLOAD_URL="${DOWNLOAD_URL:-}"
@@ -181,10 +181,9 @@ format_bytes() {
 show_dashboard() {
     load_config
     local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color
-    local blue='' green='' red='' yellow='' cyan='' magenta='' dim='' reset=''
+    local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ -t 1 ]; then
-        blue=$'\033[1;34m'; green=$'\033[1;32m'; red=$'\033[1;31m'
-        yellow=$'\033[1;33m'; cyan=$'\033[1;36m'; magenta=$'\033[1;35m'
+        blue=$'\033[1;34m'; green=$'\033[1;32m'; yellow=$'\033[1;33m'; cyan=$'\033[1;36m'
         dim=$'\033[0;37m'; reset=$'\033[0m'
     fi
 
@@ -219,21 +218,21 @@ show_dashboard() {
         rate_label="${rate} Mbps"
     fi
     [ "$DIRECTION" = both ] && direction_text="双向" || direction_text="出站"
-    if [ "$service_state" = active ]; then service_color="$green"; else service_color="$red"; fi
+    if [ "$service_state" = active ]; then service_color="$green"; else service_color="$yellow"; fi
     if [ "$DOWNLOAD_ENABLED" = true ]; then download_state="已开启"; download_color="$green"; else download_state="已关闭"; download_color="$dim"; fi
-    if [ "$gap" -eq 0 ]; then gap_color="$green"; else gap_color="$red"; fi
+    if [ "$gap" -eq 0 ]; then gap_color="$green"; else gap_color="$yellow"; fi
 
     printf '%s=== 自适应限速与流量管理 v%s ===%s\n' "$blue" "$SCRIPT_VERSION" "$reset"
     printf '%s服务：%s%-10s%s | 网卡：%s%-12s%s | 限速方向：%s%s%s\n' \
         "$dim" "$service_color" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
-    printf '当前限速：%s%s%s | 活跃计时：%ss | 阶段：%s\n' \
-        "$magenta" "$rate_label" "$reset" "$active_seconds" "$RATE_STAGES"
+    printf '当前限速：%s%s%s | 活跃计时：%s%ss%s | 阶段：%s%s%s\n' \
+        "$yellow" "$rate_label" "$reset" "$yellow" "$active_seconds" "$reset" "$cyan" "$RATE_STAGES" "$reset"
     printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前小时 (UTC)：%s%s%s\n' \
         "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$hour" "$reset"
-    printf '%s整机流量：%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
-        "$dim" "$iface" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
+    printf '%s整机流量：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
+        "$dim" "$cyan" "$iface" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
     printf '目标入站：出站 × %s%s%s = %s%s%s | 待补缺口：%s%s%s\n' \
-        "$magenta" "$DOWNLOAD_RX_FRACTION" "$reset" "$cyan" "$(format_bytes "$target")" "$reset" "$gap_color" "$(format_bytes "$gap")" "$reset"
+        "$yellow" "$DOWNLOAD_RX_FRACTION" "$reset" "$green" "$(format_bytes "$target")" "$reset" "$gap_color" "$(format_bytes "$gap")" "$reset"
     printf '补充下载：%s%s%s | 速率上限：%s%s Mbps%s | 来源：%s腾讯镜像%s\n' \
         "$download_color" "$download_state" "$reset" "$yellow" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')" "$reset" "$blue" "$reset"
     printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
@@ -430,6 +429,14 @@ pause_menu() {
     read -r -p "按回车返回菜单..." _ || true
 }
 
+menu_option() {
+    local number="$1" label="$2" blue='' reset=''
+    if [ -t 1 ]; then
+        blue=$'\033[1;34m'; reset=$'\033[0m'
+    fi
+    printf '  %s%s%s. %s\n' "$blue" "$number" "$reset" "$label"
+}
+
 show_tc_status() {
     need_root
     load_config
@@ -560,10 +567,10 @@ config_submenu() {
         clear 2>/dev/null || true
         load_config
         echo "========== 配置管理 =========="
-        echo "  1. 限速策略与网卡"
-        echo "  2. 不对等流量补充"
-        echo "  3. 编辑完整原始配置"
-        echo "  0. 返回主菜单"
+        menu_option 1 "限速策略与网卡"
+        menu_option 2 "不对等流量补充"
+        menu_option 3 "编辑完整原始配置"
+        menu_option 0 "返回主菜单"
         echo
         read -r -p "请选择 [0-3]: " category
         case "$category" in
@@ -572,12 +579,12 @@ config_submenu() {
                     clear 2>/dev/null || true
                     load_config
                     echo "====== 限速策略与网卡 ======"
-                    echo "  1. 网卡（当前：${IFACE:-自动检测}）"
-                    echo "  2. 分阶段速率（当前：$RATE_STAGES）"
-                    echo "  3. 恢复阈值（当前：$RECOVERY_RATE_MBPS Mbps）"
-                    echo "  4. 恢复等待（当前：$RECOVERY_SECONDS 秒）"
-                    echo "  5. 限速方向（当前：$DIRECTION）"
-                    echo "  0. 返回配置菜单"
+                    menu_option 1 "网卡（当前：${IFACE:-自动检测}）"
+                    menu_option 2 "分阶段速率（当前：$RATE_STAGES）"
+                    menu_option 3 "恢复阈值（当前：$RECOVERY_RATE_MBPS Mbps）"
+                    menu_option 4 "恢复等待（当前：$RECOVERY_SECONDS 秒）"
+                    menu_option 5 "限速方向（当前：$DIRECTION）"
+                    menu_option 0 "返回配置菜单"
                     read -r -p "请选择 [0-5]: " choice
                     case "$choice" in
                         1) configure_one IFACE "网卡名（输入 auto 自动检测）"; pause_menu ;;
@@ -597,12 +604,12 @@ config_submenu() {
                     local rate_mbps
                     rate_mbps="$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.2f", bytes*8/1000000; else printf "0 (不限速)"}')"
                     echo "====== 不对等流量补充 ======"
-                    echo "  1. 自动补充开关（当前：$DOWNLOAD_ENABLED）"
-                    echo "  2. 入站/出站目标比例（当前：$DOWNLOAD_RX_FRACTION）"
-                    echo "  3. 每小时最大补充量（当前：$MAX_DOWNLOAD_BYTES_PER_HOUR bytes；0 为不限）"
-                    echo "  4. 下载速度上限（当前：$rate_mbps Mbps；0 为不限）"
-                    echo "  5. 腾讯镜像下载 URL"
-                    echo "  0. 返回配置菜单"
+                    menu_option 1 "自动补充开关（当前：$DOWNLOAD_ENABLED）"
+                    menu_option 2 "入站/出站目标比例（当前：$DOWNLOAD_RX_FRACTION）"
+                    menu_option 3 "每小时最大补充量（当前：$MAX_DOWNLOAD_BYTES_PER_HOUR bytes；0 为不限）"
+                    menu_option 4 "下载速度上限（当前：$rate_mbps Mbps；0 为不限）"
+                    menu_option 5 "腾讯镜像下载 URL"
+                    menu_option 0 "返回配置菜单"
                     read -r -p "请选择 [0-5]: " choice
                     case "$choice" in
                         1) configure_one DOWNLOAD_ENABLED "启用自动下载补足？输入 true 或 false"; pause_menu ;;
@@ -635,16 +642,16 @@ show_menu() {
     while true; do
         clear 2>/dev/null || true
         show_dashboard
-        echo "  1. 查看服务状态、配置和最近日志"
-        echo "  2. 启动服务"
-        echo "  3. 停止服务并清理限速"
-        echo "  4. 重启服务并应用配置"
-        echo "  5. 查看实时服务日志"
-        echo "  6. 查看 tc 限速统计"
-        echo "  7. 配置管理（二级菜单）"
-        echo "  8. 从 GitHub 获取最新脚本"
-        echo "  9. 卸载服务和 xs 快捷命令"
-        echo "  0. 退出"
+        menu_option 1 "查看服务状态、配置和最近日志"
+        menu_option 2 "启动服务"
+        menu_option 3 "停止服务并清理限速"
+        menu_option 4 "重启服务并应用配置"
+        menu_option 5 "查看实时服务日志"
+        menu_option 6 "查看 tc 限速统计"
+        menu_option 7 "配置管理（二级菜单）"
+        menu_option 8 "从 GitHub 获取最新脚本"
+        menu_option 9 "卸载服务和 xs 快捷命令"
+        menu_option 0 "退出"
         echo
         read -r -p "请选择 [0-9]: " choice
         case "$choice" in
