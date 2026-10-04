@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.4"
+readonly SCRIPT_VERSION="1.2.5"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -214,7 +214,7 @@ show_dashboard() {
     rate="$(state_get CURRENT_RATE none)"
     active_seconds="$(state_get ACTIVE_SECONDS 0)"
     if [ "$rate" = "none" ]; then
-        rate_label="未运行"
+        if [ "$service_state" = activating ]; then rate_label="启动中"; else rate_label="未运行"; fi
     else
         rate_label="${rate} Mbps"
     fi
@@ -660,7 +660,23 @@ config_submenu() {
 service_action() {
     need_root
     local action="$1"
-    systemctl "$action" adaptive-traffic.service
+    if ! systemctl "$action" adaptive-traffic.service; then
+        echo "服务操作失败：$action"
+        journalctl -u adaptive-traffic.service -n 12 --no-pager 2>/dev/null || true
+        return 1
+    fi
+    if [ "$action" = start ] || [ "$action" = restart ]; then
+        local state i
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            state="$(systemctl is-active adaptive-traffic.service 2>/dev/null || true)"
+            [ "$state" = active ] && { echo "服务已启动：$action"; return 0; }
+            [[ "$state" == failed || "$state" == inactive || "$state" == deactivating ]] && break
+            sleep 1
+        done
+        echo "服务未进入运行状态，当前状态：${state:-未知}"
+        journalctl -u adaptive-traffic.service -n 12 --no-pager 2>/dev/null || true
+        return 1
+    fi
     echo "服务操作完成：$action"
 }
 
