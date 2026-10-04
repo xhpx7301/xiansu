@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.6"
+readonly SCRIPT_VERSION="1.2.7"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -17,6 +17,7 @@ readonly INSTALL_PATH="/usr/local/bin/adaptive-traffic.sh"
 readonly SHORTCUT_PATH="/usr/local/bin/xs"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xhpx7301/xiansu/main/adaptive-traffic.sh"
 COLOR_OUTPUT=0
+RUN_IFACE=''
 
 log() {
     mkdir -p "$CONFIG_DIR"
@@ -140,6 +141,16 @@ cleanup_tc() {
     fi
 }
 
+cleanup_run() {
+    if [ -n "${RUN_IFACE:-}" ]; then
+        cleanup_tc "$RUN_IFACE"
+    fi
+    state_set CURRENT_RATE none
+    state_set ACTIVE_SECONDS 0
+    rm -f "$PID_FILE"
+    RUN_IFACE=''
+}
+
 stage_rate() {
     local elapsed="$1" stage rate seconds total=0
     IFS=',' read -ra stages <<< "$RATE_STAGES"
@@ -194,7 +205,8 @@ show_dashboard() {
     [ -n "$service_state" ] || service_state="inactive"
     hour="$(date -u +%Y%m%d%H)"
     state_hour="$(state_get HOUR 0)"
-    read -r rx tx <<< "$(read_counters "$iface" 2>/dev/null || printf '0 0')"
+    IFS=' ' read -r rx tx <<< "$(read_counters "$iface" 2>/dev/null || printf '0 0')"
+    rx="${rx:-0}"; tx="${tx:-0}"
     rx_base="$(state_get HOUR_START_RX 0)"
     tx_base="$(state_get HOUR_START_TX 0)"
     if [ "$state_hour" = "$hour" ]; then
@@ -280,13 +292,16 @@ run() {
     load_config; validate_config
     local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour last_download_check=0 last_state_seconds=-1
     iface="$(detect_iface)"; [ -n "$iface" ] || die "无法检测默认路由网卡"
+    RUN_IFACE="$iface"
     echo "$$" > "$PID_FILE"
-    trap 'cleanup_tc "$iface"; state_set CURRENT_RATE none; state_set ACTIVE_SECONDS 0; rm -f "$PID_FILE"' EXIT
+    trap cleanup_run EXIT
     trap 'exit 0' INT TERM
-    read -r prev_rx prev_tx <<< "$(read_counters "$iface")"
+    IFS=' ' read -r prev_rx prev_tx <<< "$(read_counters "$iface")"
+    prev_rx="${prev_rx:-0}"; prev_tx="${prev_tx:-0}"
     log "启动 v$SCRIPT_VERSION，网卡=$iface，方向=$DIRECTION，阶段=$RATE_STAGES"
     while :; do
-        read -r rx tx <<< "$(read_counters "$iface")"
+        IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+        rx="${rx:-0}"; tx="${tx:-0}"
         delta=$(( (rx - prev_rx) + (tx - prev_tx) )); [ "$delta" -ge 0 ] || delta=0
         sample_mbps="$(awk -v bytes="$delta" 'BEGIN {printf "%.6f", bytes*8/1000000}')"
         if awk -v sample="$sample_mbps" -v threshold="$RECOVERY_RATE_MBPS" 'BEGIN {exit !(sample < threshold)}'; then
