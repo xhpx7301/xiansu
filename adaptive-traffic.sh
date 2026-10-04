@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -336,7 +336,7 @@ install_script_file() {
         fi
     else
         temp_file="$(mktemp)"
-        if ! curl -fsSL --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$temp_file"; then
+        if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$temp_file"; then
             rm -f "$temp_file"
             die "无法从 GitHub 下载最新脚本：$SCRIPT_URL"
         fi
@@ -389,7 +389,7 @@ update_script() {
     local temp_file remote_version current_version
     temp_file="$(mktemp)"
     echo "正在从 GitHub 获取最新脚本..."
-    if ! curl -fsSL --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$temp_file"; then
+    if ! curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$temp_file"; then
         rm -f "$temp_file"
         die "下载失败：$SCRIPT_URL"
     fi
