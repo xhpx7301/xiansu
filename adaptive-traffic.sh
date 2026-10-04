@@ -167,6 +167,75 @@ state_set() {
     mv "$tmp" "$STATE_FILE"
 }
 
+format_bytes() {
+    awk -v bytes="${1:-0}" 'BEGIN {
+        if (bytes < 0) bytes = 0
+        if (bytes >= 1099511627776) printf "%.2f TiB", bytes / 1099511627776
+        else if (bytes >= 1073741824) printf "%.2f GiB", bytes / 1073741824
+        else if (bytes >= 1048576) printf "%.2f MiB", bytes / 1048576
+        else if (bytes >= 1024) printf "%.2f KiB", bytes / 1024
+        else printf "%.0f B", bytes
+    }'
+}
+
+show_dashboard() {
+    load_config
+    local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text
+    local blue='' green='' yellow='' cyan='' dim='' reset=''
+    if [ -t 1 ]; then
+        blue=$'\033[1;34m'; green=$'\033[1;32m'; yellow=$'\033[1;33m'
+        cyan=$'\033[1;36m'; dim=$'\033[0;37m'; reset=$'\033[0m'
+    fi
+
+    iface="$(detect_iface 2>/dev/null || true)"
+    [ -n "$iface" ] || iface="unknown"
+    service_state="$(systemctl is-active adaptive-traffic.service 2>/dev/null || true)"
+    [ -n "$service_state" ] || service_state="inactive"
+    hour="$(date -u +%Y%m%d%H)"
+    state_hour="$(state_get HOUR 0)"
+    read -r rx tx <<< "$(read_counters "$iface" 2>/dev/null || printf '0 0')"
+    rx_base="$(state_get HOUR_START_RX 0)"
+    tx_base="$(state_get HOUR_START_TX 0)"
+    if [ "$state_hour" = "$hour" ]; then
+        hour_rx=$((rx - rx_base)); hour_tx=$((tx - tx_base))
+        [ "$hour_rx" -ge 0 ] || hour_rx=0
+        [ "$hour_tx" -ge 0 ] || hour_tx=0
+    else
+        hour_rx=0; hour_tx=0
+    fi
+    target="$(awk -v tx="$hour_tx" -v fraction="$DOWNLOAD_RX_FRACTION" 'BEGIN {printf "%.0f", tx*fraction}')"
+    gap=$((target - hour_rx)); [ "$gap" -gt 0 ] || gap=0
+    if [ "$hour_tx" -gt 0 ]; then
+        ratio="$(awk -v rx="$hour_rx" -v tx="$hour_tx" 'BEGIN {printf "%.1f%%", rx/tx*100}')"
+    else
+        ratio="--"
+    fi
+    rate="$(state_get CURRENT_RATE none)"
+    active_seconds="$(state_get ACTIVE_SECONDS 0)"
+    if [ "$rate" = "none" ]; then
+        rate_label="未运行"
+    else
+        rate_label="${rate} Mbps"
+    fi
+    [ "$DIRECTION" = both ] && direction_text="双向" || direction_text="出站"
+    [ "$DOWNLOAD_ENABLED" = true ] && download_state="已开启" || download_state="已关闭"
+
+    printf '%s=== 自适应限速与流量管理 v%s ===%s\n' "$blue" "$SCRIPT_VERSION" "$reset"
+    printf '%s服务：%s%-10s%s | 网卡：%s%-12s%s | 限速方向：%s%s%s\n' \
+        "$dim" "$green" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
+    printf '当前限速：%s%s%s | 活跃计时：%ss | 阶段：%s\n' \
+        "$yellow" "$rate_label" "$reset" "$active_seconds" "$RATE_STAGES"
+    printf '恢复条件：低于 %s Mbps 持续 %ss | 当前小时 (UTC)：%s\n' \
+        "$RECOVERY_RATE_MBPS" "$RECOVERY_SECONDS" "$hour"
+    printf '%s整机流量：%s | 入站(RX)：%s | 出站(TX)：%s | 入/出：%s%s\n' \
+        "$green" "$iface" "$(format_bytes "$hour_rx")" "$(format_bytes "$hour_tx")" "$ratio" "$reset"
+    printf '目标入站：出站 × %s = %s | 待补缺口：%s\n' \
+        "$DOWNLOAD_RX_FRACTION" "$(format_bytes "$target")" "$(format_bytes "$gap")"
+    printf '补充下载：%s | 速率上限：%s Mbps | 来源：腾讯镜像\n' \
+        "$download_state" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')"
+    printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
+}
+
 download_deficit() {
     local rx="$2" tx="$3" baseline_rx baseline_tx hour_rx hour_tx target deficit
     baseline_rx="$(state_get HOUR_START_RX 0)"; baseline_tx="$(state_get HOUR_START_TX 0)"
@@ -209,7 +278,8 @@ run() {
     local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour last_download_check=0
     iface="$(detect_iface)"; [ -n "$iface" ] || die "无法检测默认路由网卡"
     echo "$$" > "$PID_FILE"
-    trap 'cleanup_tc "$iface"; rm -f "$PID_FILE"' EXIT INT TERM
+    trap 'cleanup_tc "$iface"; state_set CURRENT_RATE none; state_set ACTIVE_SECONDS 0; rm -f "$PID_FILE"' EXIT
+    trap 'exit 0' INT TERM
     read -r prev_rx prev_tx <<< "$(read_counters "$iface")"
     log "启动 v$SCRIPT_VERSION，网卡=$iface，方向=$DIRECTION，阶段=$RATE_STAGES"
     while :; do
@@ -231,6 +301,8 @@ run() {
         if [ "$current_rate" != "${APPLIED_RATE:-}" ]; then
             apply_rate "$iface" "$current_rate"
             APPLIED_RATE="$current_rate"
+            state_set CURRENT_RATE "$current_rate"
+            state_set ACTIVE_SECONDS "$elapsed"
             log "应用限速：${current_rate} Mbps（活跃 ${elapsed}s）"
         fi
         hour="$(date -u +%Y%m%d%H)"
@@ -345,21 +417,9 @@ uninstall_service() {
 }
 
 status() {
-    load_config
-    printf '配置：%s\n' "$CONFIG_FILE"
-    local service_state iface
-    service_state="$(systemctl is-active adaptive-traffic.service 2>/dev/null || true)"
-    printf '服务：%s\n' "${service_state:-未安装或未运行}"
+    show_dashboard
+    printf '配置文件：%s\n' "$CONFIG_FILE"
     printf '快捷命令：%s\n' "$(if [ -L "$SHORTCUT_PATH" ]; then echo "已安装 ($SHORTCUT_PATH)"; else echo '未安装'; fi)"
-    printf '限速方向：%s\n' "$DIRECTION"
-    printf '限速阶段：%s\n' "$RATE_STAGES"
-    printf '恢复条件：低于 %s Mbps 持续 %ss\n' "$RECOVERY_RATE_MBPS" "$RECOVERY_SECONDS"
-    printf '不对等补充：%s，目标入站/出站=%s，下载限速=%s bytes/s\n' "$DOWNLOAD_ENABLED" "$DOWNLOAD_RX_FRACTION" "${DOWNLOAD_RATE_LIMIT:-不限速}"
-    if have ip && iface="$(detect_iface 2>/dev/null)" && [ -n "$iface" ]; then
-        printf '网卡：%s\n' "$iface"
-    fi
-    printf '状态文件：%s\n' "$STATE_FILE"
-    [ -f "$STATE_FILE" ] && cat "$STATE_FILE"
     printf '最近日志：\n'; tail -n 20 "$LOG_FILE" 2>/dev/null || true
 }
 
@@ -404,9 +464,7 @@ show_menu() {
     load_config
     while true; do
         clear 2>/dev/null || true
-        echo "=============================================="
-        echo "        自适应限速与流量管理菜单"
-        echo "=============================================="
+        show_dashboard
         echo "  1. 查看服务状态、配置和最近日志"
         echo "  2. 启动服务"
         echo "  3. 停止服务并清理限速"
