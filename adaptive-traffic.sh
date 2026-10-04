@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -16,6 +16,7 @@ readonly SERVICE_FILE="/etc/systemd/system/adaptive-traffic.service"
 readonly INSTALL_PATH="/usr/local/bin/adaptive-traffic.sh"
 readonly SHORTCUT_PATH="/usr/local/bin/xs"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xhpx7301/xiansu/main/adaptive-traffic.sh"
+COLOR_OUTPUT=0
 
 log() {
     mkdir -p "$CONFIG_DIR"
@@ -182,7 +183,7 @@ show_dashboard() {
     load_config
     local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color
     local blue='' green='' yellow='' cyan='' dim='' reset=''
-    if [ -t 1 ]; then
+    if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
         dim=$'\033[0;37m'; reset=$'\033[0m'
     fi
@@ -432,7 +433,7 @@ pause_menu() {
 
 menu_option() {
     local number="$1" label="$2" blue='' reset=''
-    if [ -t 1 ]; then
+    if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; reset=$'\033[0m'
     fi
     printf '  %s%s%s. %s\n' "$blue" "$number" "$reset" "$label"
@@ -639,6 +640,7 @@ service_action() {
 
 show_menu() {
     need_root
+    COLOR_OUTPUT=1
     load_config
     while true; do
         clear 2>/dev/null || true
