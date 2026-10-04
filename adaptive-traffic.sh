@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -183,7 +183,7 @@ show_dashboard() {
     local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color
     local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ -t 1 ]; then
-        blue=$'\033[1;34m'; green=$'\033[1;32m'; yellow=$'\033[1;33m'; cyan=$'\033[1;36m'
+        blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
         dim=$'\033[0;37m'; reset=$'\033[0m'
     fi
 
@@ -406,6 +406,7 @@ update_script() {
         systemctl restart adaptive-traffic.service
     fi
     echo "更新完成：${current_version:-未知} -> ${remote_version:-未知}"
+    echo "当前安装路径：$INSTALL_PATH；快捷命令：$SHORTCUT_PATH"
     log "脚本已从 GitHub 更新：${current_version:-未知} -> ${remote_version:-未知}"
 }
 
@@ -432,7 +433,7 @@ pause_menu() {
 menu_option() {
     local number="$1" label="$2" blue='' reset=''
     if [ -t 1 ]; then
-        blue=$'\033[1;34m'; reset=$'\033[0m'
+        blue=$'\033[94m'; reset=$'\033[0m'
     fi
     printf '  %s%s%s. %s\n' "$blue" "$number" "$reset" "$label"
 }
