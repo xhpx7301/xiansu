@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.5"
+readonly SCRIPT_VERSION="1.2.6"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -185,7 +185,7 @@ show_dashboard() {
     local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
-        dim=$'\033[0;37m'; reset=$'\033[0m'
+        dim=$'\033[92m'; reset=$'\033[0m'
     fi
 
     iface="$(detect_iface 2>/dev/null || true)"
@@ -439,11 +439,11 @@ pause_menu() {
 }
 
 menu_option() {
-    local number="$1" label="$2" blue='' reset=''
+    local number="$1" label="$2" blue='' green='' reset=''
     if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
-        blue=$'\033[94m'; reset=$'\033[0m'
+        blue=$'\033[94m'; green=$'\033[92m'; reset=$'\033[0m'
     fi
-    printf '  %s%s%s. %s\n' "$blue" "$number" "$reset" "$label"
+    printf '  %s%s%s. %s%s%s\n' "$blue" "$number" "$reset" "$green" "$label" "$reset"
 }
 
 show_tc_status() {
