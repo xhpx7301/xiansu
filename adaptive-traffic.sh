@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.9"
+readonly SCRIPT_VERSION="1.3.0"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -426,7 +426,14 @@ update_script() {
     install -m 0755 "$temp_file" "$INSTALL_PATH"
     rm -f "$temp_file"
     ln -sfn "$INSTALL_PATH" "$SHORTCUT_PATH"
-    if [ -f "$CONFIG_FILE" ] && grep -q '^DOWNLOAD_RX_FRACTION=1\.333333$' "$CONFIG_FILE"; then
+    if [ -f "$CONFIG_FILE" ] && awk -F= '
+        $1 == "DOWNLOAD_RX_FRACTION" {
+            value=$2
+            gsub(/[[:space:]\"]/, "", value)
+            if (value == "1.333333") found=1
+        }
+        END { exit !found }
+    ' "$CONFIG_FILE"; then
         set_config_value DOWNLOAD_RX_FRACTION 1.4
         log "已将旧默认入站目标比例从 1.333333 迁移为 1.4（多 40%）"
     fi
