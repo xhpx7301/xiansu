@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.7"
+readonly SCRIPT_VERSION="1.2.8"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -16,6 +16,7 @@ readonly SERVICE_FILE="/etc/systemd/system/adaptive-traffic.service"
 readonly INSTALL_PATH="/usr/local/bin/adaptive-traffic.sh"
 readonly SHORTCUT_PATH="/usr/local/bin/xs"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xhpx7301/xiansu/main/adaptive-traffic.sh"
+readonly DOWNLOAD_CHECK_INTERVAL_SECONDS=3600
 COLOR_OUTPUT=0
 RUN_IFACE=''
 
@@ -290,7 +291,8 @@ run() {
     have awk || die "缺少 awk"
     have curl || die "缺少 curl"
     load_config; validate_config
-    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour last_download_check=0 last_state_seconds=-1
+    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour last_download_check last_state_seconds=-1
+    last_download_check="$(date +%s)"
     iface="$(detect_iface)"; [ -n "$iface" ] || die "无法检测默认路由网卡"
     RUN_IFACE="$iface"
     echo "$$" > "$PID_FILE"
@@ -331,10 +333,10 @@ run() {
         hour="$(date -u +%Y%m%d%H)"
         if [ "$(state_get HOUR 0)" != "$hour" ]; then
             state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"
-            last_download_check=0
+            last_download_check="$(date +%s)"
             log "开始统计 UTC 小时 $hour，基线 rx=$rx tx=$tx"
         fi
-        if [ "$DOWNLOAD_ENABLED" = true ] && [ $(( $(date +%s) - last_download_check )) -ge 60 ]; then
+        if [ "$DOWNLOAD_ENABLED" = true ] && [ $(( $(date +%s) - last_download_check )) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
             download_until_target "$iface" "$hour" "$rx" "$tx"
             last_download_check="$(date +%s)"
         fi
