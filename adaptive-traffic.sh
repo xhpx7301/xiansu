@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.2.8"
+readonly SCRIPT_VERSION="1.2.9"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -46,9 +46,9 @@ RECOVERY_SECONDS=30
 DIRECTION="egress"
 # 是否按小时补充入站流量。默认开启；false 时只统计和限速
 DOWNLOAD_ENABLED=true
-# 目标为：每小时入站比出站多三分之一，即入站至少达到出站的 4/3
-DOWNLOAD_RX_FRACTION=1.333333
-# 每小时下载上限，0 表示不设上限；不设上限才能在高流量时完成 4/3 目标
+# 目标为：每小时入站比出站多 40%，即入站至少达到出站的 1.4 倍
+DOWNLOAD_RX_FRACTION=1.4
+# 每小时下载上限，0 表示不设上限；不设上限才能在高流量时完成 1.4 倍目标
 MAX_DOWNLOAD_BYTES_PER_HOUR=0
 # 腾讯镜像中的公开 npm 包；可替换为你有权访问的腾讯对象/软件包 URL
 DOWNLOAD_URL="https://mirrors.tencent.com/npm/lodash/-/lodash-4.17.21.tgz"
@@ -67,7 +67,7 @@ EOF
     RECOVERY_SECONDS="${RECOVERY_SECONDS:-30}"
     DIRECTION="${DIRECTION:-egress}"
     DOWNLOAD_ENABLED="${DOWNLOAD_ENABLED:-true}"
-    DOWNLOAD_RX_FRACTION="${DOWNLOAD_RX_FRACTION:-1.333333}"
+    DOWNLOAD_RX_FRACTION="${DOWNLOAD_RX_FRACTION:-1.4}"
     MAX_DOWNLOAD_BYTES_PER_HOUR="${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}"
     DOWNLOAD_URL="${DOWNLOAD_URL:-}"
     DOWNLOAD_RATE_LIMIT="${DOWNLOAD_RATE_LIMIT-5000000}"
@@ -426,6 +426,10 @@ update_script() {
     install -m 0755 "$temp_file" "$INSTALL_PATH"
     rm -f "$temp_file"
     ln -sfn "$INSTALL_PATH" "$SHORTCUT_PATH"
+    if [ -f "$CONFIG_FILE" ] && grep -q '^DOWNLOAD_RX_FRACTION=1\.333333$' "$CONFIG_FILE"; then
+        set_config_value DOWNLOAD_RX_FRACTION 1.4
+        log "已将旧默认入站目标比例从 1.333333 迁移为 1.4（多 40%）"
+    fi
     if systemctl is-enabled adaptive-traffic.service >/dev/null 2>&1; then
         systemctl daemon-reload
         systemctl restart adaptive-traffic.service
@@ -528,7 +532,7 @@ set_config_value() {
         echo "配置文件语法校验失败，未保存。" >&2
         return 1
     fi
-    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.333333}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
+    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.4}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
         rm -f "$temp_file"
         echo "配置值校验失败，未保存。" >&2
         return 1
@@ -649,7 +653,7 @@ config_submenu() {
                     read -r -p "请选择 [0-5]: " choice
                     case "$choice" in
                         1) configure_one DOWNLOAD_ENABLED "启用自动下载补足？输入 true 或 false"; pause_menu ;;
-                        2) configure_one DOWNLOAD_RX_FRACTION "目标入站/出站比例（1.333333 表示多三分之一）"; pause_menu ;;
+                        2) configure_one DOWNLOAD_RX_FRACTION "目标入站/出站比例（1.4 表示多 40%）"; pause_menu ;;
                         3) configure_one MAX_DOWNLOAD_BYTES_PER_HOUR "每小时最大下载字节数（0 为不限）"; pause_menu ;;
                         4) configure_one DOWNLOAD_RATE_LIMIT "下载限速 Mbps（40 表示 40 Mbps，0 为不限）"; pause_menu ;;
                         5) configure_one DOWNLOAD_URL "下载 URL"; pause_menu ;;

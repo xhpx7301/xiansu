@@ -8,7 +8,7 @@
 - 默认限速方向为出站，限制整张网卡上的出站流量。
 - 当采样吞吐率低于 `5 Mbps` 并持续 `30 秒` 时，恢复到 `160 Mbps` 第一阶段。
 - 按 UTC 小时统计整机入站和出站字节数。
-- 默认目标为：入站流量达到出站流量的 `4/3`，即入站比出站多三分之一。
+- 默认目标为：入站流量达到出站流量的 `1.4` 倍，即入站比出站多 40%。
 - 发现入站缺口后，从配置的腾讯 npm 镜像重复下载文件补足。
 - 补充下载默认限制为 `5000000` 字节/秒，约等于 `40 Mbps`。
 - 下载内容写入 `/dev/null`，不会在硬盘上累积下载文件。
@@ -102,7 +102,7 @@ RECOVERY_SECONDS=30
 DIRECTION="egress"
 
 DOWNLOAD_ENABLED=true
-DOWNLOAD_RX_FRACTION=1.333333
+DOWNLOAD_RX_FRACTION=1.4
 MAX_DOWNLOAD_BYTES_PER_HOUR=0
 DOWNLOAD_URL="https://mirrors.tencent.com/npm/lodash/-/lodash-4.17.21.tgz"
 DOWNLOAD_RATE_LIMIT="5000000"
@@ -119,22 +119,22 @@ sudo nano /etc/adaptive-traffic/config.env
 
 ```bash
 DOWNLOAD_ENABLED=true
-DOWNLOAD_RX_FRACTION=1.333333
+DOWNLOAD_RX_FRACTION=1.4
 MAX_DOWNLOAD_BYTES_PER_HOUR=0
 DOWNLOAD_URL="https://mirrors.tencent.com/npm/lodash/-/lodash-4.17.21.tgz"
 DOWNLOAD_RATE_LIMIT="5000000"
 ```
 
-`DOWNLOAD_RX_FRACTION=1.333333` 的含义是：
+`DOWNLOAD_RX_FRACTION=1.4` 的含义是：
 
 ```text
-目标入站 = 出站 × 4/3
+目标入站 = 出站 × 1.4
 需要补充的入站 = 目标入站 - 已有入站
 ```
 
-例如某小时出站 30 GB、自然入站 30 GB，目标入站为 40 GB，脚本会额外下载约 10 GB。
+例如某小时出站 30 GB、自然入站 30 GB，目标入站为 42 GB，脚本会额外下载约 12 GB。
 
-补充下载的检查周期是每 60 分钟一次。每个 UTC 小时开始时，服务会记录当前网卡计数器作为本小时基线，并在约 60 分钟后检查一次；只有目标入站量高于当前入站量时才下载，下载内容直接写入 `/dev/null`，达到缺口后停止。
+补充下载的检查周期是每 60 分钟一次。每个 UTC 小时开始时，服务会记录当前网卡计数器作为本小时基线，并在约 60 分钟后检查一次；只有目标入站量高于当前入站量时才下载，下载内容直接写入 `/dev/null`，达到缺口后停止。默认目标是入站达到出站的 1.4 倍，即多 40%。
 
 ## 限速和恢复逻辑
 
@@ -160,7 +160,7 @@ DOWNLOAD_RATE_LIMIT="5000000"
 5000000 bytes/s × 8 ≈ 40 Mbps
 ```
 
-如果将 `MAX_DOWNLOAD_BYTES_PER_HOUR` 设置为具体数值，达到上限后可能无法完成入站为出站 `4/3` 的目标；设置为 `0` 表示不设置每小时补充上限。
+如果将 `MAX_DOWNLOAD_BYTES_PER_HOUR` 设置为具体数值，达到上限后可能无法完成入站为出站 `1.4` 倍的目标；设置为 `0` 表示不设置每小时补充上限。
 
 ## 查看和卸载
 
