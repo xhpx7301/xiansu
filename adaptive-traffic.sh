@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.4.1"
+readonly SCRIPT_VERSION="1.4.2"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -299,7 +299,7 @@ show_dashboard() {
     printf '限速阶段：%s%s%s\n' "$cyan" "$(format_rate_stages)" "$reset"
     printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前时间 (北京时间)：%s%s%s\n' \
         "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$beijing_now" "$reset"
-    printf '%s整机流量：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
+    printf '%s本小时累计（北京时间）：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
         "$dim" "$cyan" "$iface" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
     printf '目标入站：出站 × %s%s%s = %s%s%s | 待补缺口：%s%s%s\n' \
         "$yellow" "$DOWNLOAD_RX_FRACTION" "$reset" "$green" "$(format_bytes "$target")" "$reset" "$gap_color" "$(format_bytes "$gap")" "$reset"
@@ -436,11 +436,23 @@ run() {
                 state_set MONTH "$month"; state_set MONTH_START_RX "$rx"; state_set MONTH_START_TX "$tx"; state_set MONTH_START_EPOCH "$now"; state_set MONTH_DOWNLOAD_BYTES 0; state_set MONTH_DOWNLOAD_CHECKS 0
                 log "开始统计北京时间月份 $month，月度基线 rx=$rx tx=$tx"
             fi
-            state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
-            state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
-            last_download_check="$now"
+            if [ "$state_hour" != "$hour" ]; then
+                state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
+                state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+                last_download_check="$now"
+                log "开始统计北京时间小时 $hour，基线 rx=$rx tx=$tx"
+            else
+                local saved_next_check
+                saved_next_check="$(state_get DOWNLOAD_NEXT_CHECK_EPOCH 0)"
+                if [[ "$saved_next_check" =~ ^[0-9]+$ ]] && [ "$saved_next_check" -gt 0 ]; then
+                    last_download_check="$((saved_next_check - DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+                else
+                    last_download_check="$now"
+                    state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+                fi
+                log "继续统计北京时间小时 $hour，沿用已有小时基线"
+            fi
             process_initialized=1
-            log "开始统计北京时间小时 $hour，基线 rx=$rx tx=$tx"
         else
             if [ "$state_month" != "$month" ]; then
                 state_set MONTH "$month"; state_set MONTH_START_RX "$rx"; state_set MONTH_START_TX "$tx"; state_set MONTH_START_EPOCH "$now"; state_set MONTH_DOWNLOAD_BYTES 0; state_set MONTH_DOWNLOAD_CHECKS 0
