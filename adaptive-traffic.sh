@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.5.1"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -318,8 +318,10 @@ show_dashboard() {
         "$download_color" "$download_state" "$reset" "$yellow" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')" "$reset" "$blue" "$reset"
     printf '补充记录：%s%s%s | 检查缺口：%s | 本次：%s%s%s | 上次：%s | 下次：%s | 累计：%s\n' \
         "$download_color" "$download_status" "$reset" "$(format_bytes "$download_last_deficit")" "$cyan" "$(format_bytes "$download_last_bytes")" "$reset" "$(format_time "$download_last_check")" "$(format_time "$download_next_check")" "$(format_bytes "$download_total_bytes")"
-    printf '本月累计（北京时间，自 %s 起）：入站 %s | 出站 %s | 目标入站 %s | 本月累计缺口 %s | 已补充 %s | 检查 %s 次\n' \
-        "$month_start_time" "$(format_bytes "$month_rx")" "$(format_bytes "$month_tx")" "$(format_bytes "$month_target")" "$(format_bytes "$month_gap")" "$(format_bytes "$month_download_bytes")" "$month_checks"
+    printf '本月累计（北京时间）：入站 %s | 出站 %s | 目标入站 %s\n' \
+        "$(format_bytes "$month_rx")" "$(format_bytes "$month_tx")" "$(format_bytes "$month_target")"
+    printf '统计起始时间：%s | 本月累计缺口：%s | 已补充：%s | 检查 %s 次\n' \
+        "$month_start_time" "$(format_bytes "$month_gap")" "$(format_bytes "$month_download_bytes")" "$month_checks"
     printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
 }
 
