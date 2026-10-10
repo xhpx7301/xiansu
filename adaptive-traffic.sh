@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.3.1"
+readonly SCRIPT_VERSION="1.4.0"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -17,6 +17,7 @@ readonly INSTALL_PATH="/usr/local/bin/adaptive-traffic.sh"
 readonly SHORTCUT_PATH="/usr/local/bin/xs"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xhpx7301/xiansu/main/adaptive-traffic.sh"
 readonly DOWNLOAD_CHECK_INTERVAL_SECONDS=3600
+readonly DISPLAY_TZ="Asia/Shanghai"
 COLOR_OUTPUT=0
 RUN_IFACE=''
 
@@ -194,15 +195,19 @@ format_bytes() {
 format_time() {
     local epoch="${1:-0}"
     if [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$epoch" -gt 0 ]; then
-        date -u -d "@$epoch" '+%m-%d %H:%M' 2>/dev/null || printf '%s' '-'
+        TZ="$DISPLAY_TZ" date -d "@$epoch" '+%m-%d %H:%M' 2>/dev/null || printf '%s' '-'
     else
         printf '%s' '-'
     fi
 }
 
+beijing_date() {
+    TZ="$DISPLAY_TZ" date "$@"
+}
+
 show_dashboard() {
     load_config
-    local iface service_state hour state_hour rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes
+    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx month_target month_gap month_download_bytes month_checks
     local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
@@ -213,8 +218,11 @@ show_dashboard() {
     [ -n "$iface" ] || iface="unknown"
     service_state="$(systemctl is-active adaptive-traffic.service 2>/dev/null || true)"
     [ -n "$service_state" ] || service_state="inactive"
-    hour="$(date -u +%Y%m%d%H)"
+    hour="$(beijing_date +%Y%m%d%H)"
+    month="$(beijing_date +%Y%m)"
+    beijing_now="$(beijing_date '+%Y-%m-%d %H:%M:%S')"
     state_hour="$(state_get HOUR 0)"
+    state_month="$(state_get MONTH 0)"
     IFS=' ' read -r rx tx <<< "$(read_counters "$iface" 2>/dev/null || printf '0 0')"
     rx="${rx:-0}"; tx="${tx:-0}"
     rx_base="$(state_get HOUR_START_RX 0)"
@@ -226,6 +234,17 @@ show_dashboard() {
     else
         hour_rx=0; hour_tx=0
     fi
+    month_rx_base="$(state_get MONTH_START_RX 0)"
+    month_tx_base="$(state_get MONTH_START_TX 0)"
+    if [ "$state_month" = "$month" ]; then
+        month_rx=$((rx - month_rx_base)); month_tx=$((tx - month_tx_base))
+        [ "$month_rx" -ge 0 ] || month_rx=0
+        [ "$month_tx" -ge 0 ] || month_tx=0
+    else
+        month_rx=0; month_tx=0
+    fi
+    month_target="$(awk -v tx="$month_tx" -v fraction="$DOWNLOAD_RX_FRACTION" 'BEGIN {printf "%.0f", tx*fraction}')"
+    month_gap=$((month_target - month_rx)); [ "$month_gap" -gt 0 ] || month_gap=0
     target="$(awk -v tx="$hour_tx" -v fraction="$DOWNLOAD_RX_FRACTION" 'BEGIN {printf "%.0f", tx*fraction}')"
     gap=$((target - hour_rx)); [ "$gap" -gt 0 ] || gap=0
     if [ "$hour_tx" -gt 0 ]; then
@@ -241,6 +260,8 @@ show_dashboard() {
     download_last_check="$(state_get DOWNLOAD_LAST_CHECK_EPOCH 0)"
     download_next_check="$(state_get DOWNLOAD_NEXT_CHECK_EPOCH 0)"
     download_total_bytes="$(state_get DOWNLOAD_TOTAL_BYTES 0)"
+    month_download_bytes="$(state_get MONTH_DOWNLOAD_BYTES 0)"
+    month_checks="$(state_get MONTH_DOWNLOAD_CHECKS 0)"
     if [ "$rate" = "none" ]; then
         if [ "$service_state" = activating ]; then rate_label="启动中"; else rate_label="未运行"; fi
     else
@@ -256,8 +277,8 @@ show_dashboard() {
         "$dim" "$service_color" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
     printf '当前限速：%s%s%s | 活跃计时：%s%ss%s | 阶段：%s%s%s\n' \
         "$yellow" "$rate_label" "$reset" "$yellow" "$active_seconds" "$reset" "$cyan" "$RATE_STAGES" "$reset"
-    printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前小时 (UTC)：%s%s%s\n' \
-        "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$hour" "$reset"
+    printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前时间 (北京时间)：%s%s%s\n' \
+        "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$beijing_now" "$reset"
     printf '%s整机流量：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
         "$dim" "$cyan" "$iface" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
     printf '目标入站：出站 × %s%s%s = %s%s%s | 待补缺口：%s%s%s\n' \
@@ -266,6 +287,8 @@ show_dashboard() {
         "$download_color" "$download_state" "$reset" "$yellow" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')" "$reset" "$blue" "$reset"
     printf '补充记录：%s%s%s | 检查缺口：%s | 本次：%s%s%s | 上次：%s | 下次：%s | 累计：%s\n' \
         "$download_color" "$download_status" "$reset" "$(format_bytes "$download_last_deficit")" "$cyan" "$(format_bytes "$download_last_bytes")" "$reset" "$(format_time "$download_last_check")" "$(format_time "$download_next_check")" "$(format_bytes "$download_total_bytes")"
+    printf '本月累计 (北京时间)：入站 %s | 出站 %s | 目标入站 %s | 当前缺口 %s | 已补充 %s | 检查 %s 次\n' \
+        "$(format_bytes "$month_rx")" "$(format_bytes "$month_tx")" "$(format_bytes "$month_target")" "$(format_bytes "$month_gap")" "$(format_bytes "$month_download_bytes")" "$month_checks"
     printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
 }
 
@@ -281,10 +304,13 @@ download_deficit() {
 }
 
 download_until_target() {
-    local iface="$1" hour="$2" rx="$3" tx="$4" deficit initial_deficit before after got remaining curl_args downloaded=0 status now total_downloaded
+    local iface="$1" hour="$2" rx="$3" tx="$4" deficit initial_deficit before after got remaining curl_args downloaded=0 status now total_downloaded month_downloaded month_check_count
     now="$(date +%s)"
     state_set DOWNLOAD_LAST_CHECK_EPOCH "$now"
     state_set DOWNLOAD_LAST_CHECK_HOUR "$hour"
+    month_check_count="$(state_get MONTH_DOWNLOAD_CHECKS 0)"
+    [[ "$month_check_count" =~ ^[0-9]+$ ]] || month_check_count=0
+    state_set MONTH_DOWNLOAD_CHECKS "$((month_check_count + 1))"
     state_set DOWNLOAD_LAST_BYTES 0
     state_set DOWNLOAD_LAST_STATUS 检查中
     [ "$DOWNLOAD_ENABLED" = true ] || { state_set DOWNLOAD_LAST_STATUS 已关闭; return 0; }
@@ -318,8 +344,11 @@ download_until_target() {
     done
     total_downloaded="$(state_get DOWNLOAD_TOTAL_BYTES 0)"
     [[ "$total_downloaded" =~ ^[0-9]+$ ]] || total_downloaded=0
+    month_downloaded="$(state_get MONTH_DOWNLOAD_BYTES 0)"
+    [[ "$month_downloaded" =~ ^[0-9]+$ ]] || month_downloaded=0
     state_set DOWNLOAD_LAST_BYTES "$downloaded"
     state_set DOWNLOAD_TOTAL_BYTES "$((total_downloaded + downloaded))"
+    state_set MONTH_DOWNLOAD_BYTES "$((month_downloaded + downloaded))"
     state_set DOWNLOAD_LAST_FINISHED_EPOCH "$(date +%s)"
     if [ "$deficit" -le 0 ]; then
         status=已完成
@@ -338,7 +367,7 @@ run() {
     have awk || die "缺少 awk"
     have curl || die "缺少 curl"
     load_config; validate_config
-    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour state_hour now hour_start_epoch last_download_check last_state_seconds=-1 process_initialized=0
+    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour month state_hour state_month now hour_start_epoch last_download_check last_state_seconds=-1 process_initialized=0
     last_download_check="$(date +%s)"
     iface="$(detect_iface)"; [ -n "$iface" ] || die "无法检测默认路由网卡"
     RUN_IFACE="$iface"
@@ -378,34 +407,46 @@ run() {
         fi
         APPLIED_RATE_BEFORE="$current_rate"
         now="$(date +%s)"
-        hour="$(date -u +%Y%m%d%H)"
+        hour="$(beijing_date +%Y%m%d%H)"
+        month="$(beijing_date +%Y%m)"
         state_hour="$(state_get HOUR 0)"
+        state_month="$(state_get MONTH 0)"
         if [ "$process_initialized" -eq 0 ]; then
-            state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
-            state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
-            last_download_check="$now"
-            process_initialized=1
-            log "开始统计 UTC 小时 $hour，基线 rx=$rx tx=$tx"
-        elif [ "$state_hour" != "$hour" ]; then
-            hour_start_epoch="$(state_get HOUR_START_EPOCH 0)"
-            if [ "$DOWNLOAD_ENABLED" = true ] && [ "$state_hour" != 0 ] && [ "$state_hour" != "$(state_get DOWNLOAD_LAST_CHECK_HOUR '')" ] && [[ "$hour_start_epoch" =~ ^[0-9]+$ ]] && [ $((now - hour_start_epoch)) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
-                download_until_target "$iface" "$state_hour" "$rx" "$tx"
-                IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
-                rx="${rx:-0}"; tx="${tx:-0}"
-                prev_rx="$rx"; prev_tx="$tx"
-                now="$(date +%s)"
+            if [ "$state_month" != "$month" ]; then
+                state_set MONTH "$month"; state_set MONTH_START_RX "$rx"; state_set MONTH_START_TX "$tx"; state_set MONTH_START_EPOCH "$now"; state_set MONTH_DOWNLOAD_BYTES 0; state_set MONTH_DOWNLOAD_CHECKS 0
+                log "开始统计北京时间月份 $month，月度基线 rx=$rx tx=$tx"
             fi
             state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
             state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
             last_download_check="$now"
-            log "开始统计 UTC 小时 $hour，基线 rx=$rx tx=$tx"
-        elif [ "$DOWNLOAD_ENABLED" = true ] && [ $((now - last_download_check)) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
-            download_until_target "$iface" "$hour" "$rx" "$tx"
-            IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
-            rx="${rx:-0}"; tx="${tx:-0}"
-            prev_rx="$rx"; prev_tx="$tx"
-            last_download_check="$(date +%s)"
-            state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((last_download_check + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+            process_initialized=1
+            log "开始统计北京时间小时 $hour，基线 rx=$rx tx=$tx"
+        else
+            if [ "$state_month" != "$month" ]; then
+                state_set MONTH "$month"; state_set MONTH_START_RX "$rx"; state_set MONTH_START_TX "$tx"; state_set MONTH_START_EPOCH "$now"; state_set MONTH_DOWNLOAD_BYTES 0; state_set MONTH_DOWNLOAD_CHECKS 0
+                log "开始统计北京时间月份 $month，月度基线 rx=$rx tx=$tx"
+            fi
+            if [ "$state_hour" != "$hour" ]; then
+                hour_start_epoch="$(state_get HOUR_START_EPOCH 0)"
+                if [ "$DOWNLOAD_ENABLED" = true ] && [ "$state_hour" != 0 ] && [ "$state_hour" != "$(state_get DOWNLOAD_LAST_CHECK_HOUR '')" ] && [[ "$hour_start_epoch" =~ ^[0-9]+$ ]] && [ $((now - hour_start_epoch)) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
+                    download_until_target "$iface" "$state_hour" "$rx" "$tx"
+                    IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+                    rx="${rx:-0}"; tx="${tx:-0}"
+                    prev_rx="$rx"; prev_tx="$tx"
+                    now="$(date +%s)"
+                fi
+                state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
+                state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+                last_download_check="$now"
+                log "开始统计北京时间小时 $hour，基线 rx=$rx tx=$tx"
+            elif [ "$DOWNLOAD_ENABLED" = true ] && [ $((now - last_download_check)) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
+                download_until_target "$iface" "$hour" "$rx" "$tx"
+                IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+                rx="${rx:-0}"; tx="${tx:-0}"
+                prev_rx="$rx"; prev_tx="$tx"
+                last_download_check="$(date +%s)"
+                state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((last_download_check + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+            fi
         fi
         prev_rx="$rx"; prev_tx="$tx"
         sleep 1
