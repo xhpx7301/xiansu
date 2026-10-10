@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.4.0"
+readonly SCRIPT_VERSION="1.4.1"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -192,6 +192,25 @@ format_bytes() {
     }'
 }
 
+format_rate_stages() {
+    local stage rate seconds index=1 output='' duration
+    local -a stages
+    IFS=',' read -ra stages <<< "$RATE_STAGES"
+    for stage in "${stages[@]}"; do
+        rate="${stage%%:*}"
+        seconds="${stage#*:}"
+        if [ "$seconds" -eq 0 ]; then
+            duration='持续运行'
+        else
+            duration="持续 ${seconds} 秒"
+        fi
+        [ -n "$output" ] && output+=' → '
+        output+="第${index}阶段 ${rate} Mbps ${duration}"
+        index=$((index + 1))
+    done
+    printf '%s' "$output"
+}
+
 format_time() {
     local epoch="${1:-0}"
     if [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$epoch" -gt 0 ]; then
@@ -275,8 +294,9 @@ show_dashboard() {
     printf '%s=== 自适应限速与流量管理 v%s ===%s\n' "$blue" "$SCRIPT_VERSION" "$reset"
     printf '%s服务：%s%-10s%s | 网卡：%s%-12s%s | 限速方向：%s%s%s\n' \
         "$dim" "$service_color" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
-    printf '当前限速：%s%s%s | 活跃计时：%s%ss%s | 阶段：%s%s%s\n' \
-        "$yellow" "$rate_label" "$reset" "$yellow" "$active_seconds" "$reset" "$cyan" "$RATE_STAGES" "$reset"
+    printf '当前限速：%s%s%s | 活跃计时：%s%ss%s\n' \
+        "$yellow" "$rate_label" "$reset" "$yellow" "$active_seconds" "$reset"
+    printf '限速阶段：%s%s%s\n' "$cyan" "$(format_rate_stages)" "$reset"
     printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前时间 (北京时间)：%s%s%s\n' \
         "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$beijing_now" "$reset"
     printf '%s整机流量：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
