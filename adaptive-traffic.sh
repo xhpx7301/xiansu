@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.4.2"
+readonly SCRIPT_VERSION="1.5.0"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -220,13 +220,22 @@ format_time() {
     fi
 }
 
+format_full_time() {
+    local epoch="${1:-0}"
+    if [[ "$epoch" =~ ^[0-9]+$ ]] && [ "$epoch" -gt 0 ]; then
+        TZ="$DISPLAY_TZ" date -d "@$epoch" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' '-'
+    else
+        printf '%s' '-'
+    fi
+}
+
 beijing_date() {
     TZ="$DISPLAY_TZ" date "$@"
 }
 
 show_dashboard() {
     load_config
-    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx month_target month_gap month_download_bytes month_checks
+    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx month_target month_gap month_download_bytes month_checks month_start_epoch month_start_time
     local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
@@ -281,6 +290,8 @@ show_dashboard() {
     download_total_bytes="$(state_get DOWNLOAD_TOTAL_BYTES 0)"
     month_download_bytes="$(state_get MONTH_DOWNLOAD_BYTES 0)"
     month_checks="$(state_get MONTH_DOWNLOAD_CHECKS 0)"
+    month_start_epoch="$(state_get MONTH_START_EPOCH 0)"
+    month_start_time="$(format_full_time "$month_start_epoch")"
     if [ "$rate" = "none" ]; then
         if [ "$service_state" = activating ]; then rate_label="启动中"; else rate_label="未运行"; fi
     else
@@ -301,14 +312,14 @@ show_dashboard() {
         "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$beijing_now" "$reset"
     printf '%s本小时累计（北京时间）：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
         "$dim" "$cyan" "$iface" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
-    printf '目标入站：出站 × %s%s%s = %s%s%s | 待补缺口：%s%s%s\n' \
+    printf '当前小时目标：出站 × %s%s%s = %s%s%s | 当前小时缺口：%s%s%s\n' \
         "$yellow" "$DOWNLOAD_RX_FRACTION" "$reset" "$green" "$(format_bytes "$target")" "$reset" "$gap_color" "$(format_bytes "$gap")" "$reset"
     printf '补充下载：%s%s%s | 速率上限：%s%s Mbps%s | 来源：%s腾讯镜像%s\n' \
         "$download_color" "$download_state" "$reset" "$yellow" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')" "$reset" "$blue" "$reset"
     printf '补充记录：%s%s%s | 检查缺口：%s | 本次：%s%s%s | 上次：%s | 下次：%s | 累计：%s\n' \
         "$download_color" "$download_status" "$reset" "$(format_bytes "$download_last_deficit")" "$cyan" "$(format_bytes "$download_last_bytes")" "$reset" "$(format_time "$download_last_check")" "$(format_time "$download_next_check")" "$(format_bytes "$download_total_bytes")"
-    printf '本月累计 (北京时间)：入站 %s | 出站 %s | 目标入站 %s | 当前缺口 %s | 已补充 %s | 检查 %s 次\n' \
-        "$(format_bytes "$month_rx")" "$(format_bytes "$month_tx")" "$(format_bytes "$month_target")" "$(format_bytes "$month_gap")" "$(format_bytes "$month_download_bytes")" "$month_checks"
+    printf '本月累计（北京时间，自 %s 起）：入站 %s | 出站 %s | 目标入站 %s | 本月累计缺口 %s | 已补充 %s | 检查 %s 次\n' \
+        "$month_start_time" "$(format_bytes "$month_rx")" "$(format_bytes "$month_tx")" "$(format_bytes "$month_target")" "$(format_bytes "$month_gap")" "$(format_bytes "$month_download_bytes")" "$month_checks"
     printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
 }
 
@@ -748,6 +759,50 @@ configure_one() {
     set_config_value "$key" "$rhs"
 }
 
+reset_traffic_stats() {
+    need_root
+    load_config
+    local iface rx tx now hour month was_active confirm
+    read -r -p "确认重置小时、本月和补充下载统计？配置与限速策略不会改变。输入 yes 继续：" confirm
+    [ "$confirm" = yes ] || { echo "已取消。"; return 0; }
+    iface="$(detect_iface)" || return 1
+    [ -n "$iface" ] || die "无法检测默认路由网卡"
+    was_active=0
+    if systemctl is-active --quiet adaptive-traffic.service 2>/dev/null; then
+        was_active=1
+        systemctl stop adaptive-traffic.service || { echo "停止服务失败，未重置统计。"; return 1; }
+    fi
+    IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+    rx="${rx:-0}"; tx="${tx:-0}"
+    now="$(date +%s)"
+    hour="$(beijing_date +%Y%m%d%H)"
+    month="$(beijing_date +%Y%m)"
+    state_set MONTH "$month"
+    state_set MONTH_START_RX "$rx"
+    state_set MONTH_START_TX "$tx"
+    state_set MONTH_START_EPOCH "$now"
+    state_set MONTH_DOWNLOAD_BYTES 0
+    state_set MONTH_DOWNLOAD_CHECKS 0
+    state_set HOUR "$hour"
+    state_set HOUR_START_RX "$rx"
+    state_set HOUR_START_TX "$tx"
+    state_set HOUR_START_EPOCH "$now"
+    state_set DOWNLOAD_LAST_STATUS 未检查
+    state_set DOWNLOAD_LAST_DEFICIT_BYTES 0
+    state_set DOWNLOAD_LAST_BYTES 0
+    state_set DOWNLOAD_LAST_CHECK_EPOCH 0
+    state_set DOWNLOAD_LAST_FINISHED_EPOCH 0
+    state_set DOWNLOAD_LAST_CHECK_HOUR ''
+    state_set DOWNLOAD_TOTAL_BYTES 0
+    state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+    log "流量统计已由管理菜单手动重置：北京时间 $hour，网卡=$iface，rx=$rx tx=$tx"
+    echo "统计已重置：北京时间 $hour；小时、本月和补充下载累计从现在开始。"
+    if [ "$was_active" -eq 1 ]; then
+        systemctl start adaptive-traffic.service || { echo "统计已重置，但服务启动失败，请查看 systemctl status adaptive-traffic.service。"; return 1; }
+        echo "服务已恢复运行。"
+    fi
+}
+
 config_submenu() {
     local category choice
     while true; do
@@ -757,9 +812,10 @@ config_submenu() {
         menu_option 1 "限速策略与网卡"
         menu_option 2 "不对等流量补充"
         menu_option 3 "编辑完整原始配置"
+        menu_option 4 "重置小时、本月和补充统计"
         menu_option 0 "返回主菜单"
         echo
-        read -r -p "请选择 [0-3]: " category
+        read -r -p "请选择 [0-4]: " category
         case "$category" in
             1)
                 while true; do
@@ -819,6 +875,7 @@ config_submenu() {
                 fi
                 pause_menu
                 ;;
+            4) reset_traffic_stats; pause_menu ;;
             0) return 0 ;;
             *) echo "无效选项"; sleep 1 ;;
         esac
