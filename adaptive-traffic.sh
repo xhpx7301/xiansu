@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.6.1"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -50,8 +50,8 @@ DIRECTION="egress"
 DOWNLOAD_ENABLED=true
 # 统计模式：interface 整卡；port 只统计代理端口的 TCP/UDP 流量
 TRAFFIC_STATS_MODE="interface"
-# 代理监听端口；端口模式使用该端口统计 TCP/UDP
-PROXY_PORT=49912
+# 代理监听端口列表；端口模式统计这些端口的 TCP/UDP
+PROXY_PORTS="49912"
 # 目标为：每小时入站比出站多 40%，即入站至少达到出站的 1.4 倍
 DOWNLOAD_RX_FRACTION=1.4
 # 每小时下载上限，0 表示不设上限；不设上限才能在高流量时完成 1.4 倍目标
@@ -73,7 +73,7 @@ EOF
     RECOVERY_SECONDS="${RECOVERY_SECONDS:-30}"
     DIRECTION="${DIRECTION:-egress}"
     TRAFFIC_STATS_MODE="${TRAFFIC_STATS_MODE:-interface}"
-    PROXY_PORT="${PROXY_PORT:-49912}"
+    PROXY_PORTS="${PROXY_PORTS:-${PROXY_PORT:-49912}}"
     DOWNLOAD_ENABLED="${DOWNLOAD_ENABLED:-true}"
     DOWNLOAD_RX_FRACTION="${DOWNLOAD_RX_FRACTION:-1.4}"
     MAX_DOWNLOAD_BYTES_PER_HOUR="${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}"
@@ -85,7 +85,7 @@ EOF
 validate_config() {
     [[ "$DIRECTION" == egress || "$DIRECTION" == both ]] || die "DIRECTION 必须是 egress 或 both"
     [[ "$TRAFFIC_STATS_MODE" == interface || "$TRAFFIC_STATS_MODE" == port ]] || die "TRAFFIC_STATS_MODE 必须是 interface 或 port"
-    [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ] || die "PROXY_PORT 必须是 1 到 65535 的端口"
+    valid_port_list "$PROXY_PORTS" || die "PROXY_PORTS 必须是逗号分隔的 1 到 65535 端口"
     [ "$TRAFFIC_STATS_MODE" != port ] || have nft || die "端口统计模式需要 nftables（nft 命令）"
     [[ "$RECOVERY_SECONDS" =~ ^[0-9]+$ ]] || die "RECOVERY_SECONDS 必须是整数"
     [ "$RECOVERY_SECONDS" -gt 0 ] || die "RECOVERY_SECONDS 必须大于 0"
@@ -119,8 +119,26 @@ read_counters() {
     awk -v dev="$iface:" '$1 == dev {print $2, $10; found=1} END {if (!found) print "0 0"}' /proc/net/dev
 }
 
+valid_port_list() {
+    local ports_csv="$1" port seen=','
+    local -a ports
+    [[ "$ports_csv" =~ ^[1-9][0-9]*(,[1-9][0-9]*)*$ ]] || return 1
+    IFS=',' read -ra ports <<< "$ports_csv"
+    for port in "${ports[@]}"; do
+        [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+        [[ "$seen" != *",$port,"* ]] || return 1
+        seen+="$port,"
+    done
+}
+
+port_list_label() {
+    printf '%s' "$PROXY_PORTS" | sed 's/,/, /g'
+}
+
 setup_port_counters() {
-    local iface="$1"
+    local iface="$1" port
+    local -a ports
+    IFS=',' read -ra ports <<< "$PROXY_PORTS"
     nft list table inet "$NFT_STATS_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_STATS_TABLE"
     nft list counter inet "$NFT_STATS_TABLE" proxy_rx >/dev/null 2>&1 || nft add counter inet "$NFT_STATS_TABLE" proxy_rx
     nft list counter inet "$NFT_STATS_TABLE" proxy_tx >/dev/null 2>&1 || nft add counter inet "$NFT_STATS_TABLE" proxy_tx
@@ -128,10 +146,12 @@ setup_port_counters() {
     nft list chain inet "$NFT_STATS_TABLE" output >/dev/null 2>&1 || nft add chain inet "$NFT_STATS_TABLE" output '{ type filter hook output priority 0; policy accept; }'
     nft flush chain inet "$NFT_STATS_TABLE" input
     nft flush chain inet "$NFT_STATS_TABLE" output
-    nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" tcp dport "$PROXY_PORT" counter name proxy_rx
-    nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" udp dport "$PROXY_PORT" counter name proxy_rx
-    nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" tcp sport "$PROXY_PORT" counter name proxy_tx
-    nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" udp sport "$PROXY_PORT" counter name proxy_tx
+    for port in "${ports[@]}"; do
+        nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" tcp dport "$port" counter name proxy_rx
+        nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" udp dport "$port" counter name proxy_rx
+        nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" tcp sport "$port" counter name proxy_tx
+        nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" udp sport "$port" counter name proxy_tx
+    done
 }
 
 read_port_counter() {
@@ -157,7 +177,7 @@ read_stats_counters() {
 
 stats_identity() {
     local iface="$1"
-    if [ "$TRAFFIC_STATS_MODE" = port ]; then printf 'port:%s:%s' "$iface" "$PROXY_PORT"; else printf 'interface:%s' "$iface"; fi
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then printf 'port:%s:%s' "$iface" "$PROXY_PORTS"; else printf 'interface:%s' "$iface"; fi
 }
 
 rate_to_tc() {
@@ -327,7 +347,7 @@ show_dashboard() {
         month_rx=0; month_tx=0
     fi
     if [ "$TRAFFIC_STATS_MODE" = port ]; then
-        stats_label="代理端口估算 TCP/UDP $PROXY_PORT"
+        stats_label="代理端口估算 TCP/UDP $(port_list_label)"
         business_hour_rx="$hour_rx"; business_month_rx="$month_rx"
         effective_hour_rx=$((hour_rx + hour_download_bytes))
         effective_month_rx=$((month_rx + month_download_bytes))
@@ -799,7 +819,7 @@ set_config_value() {
         echo "配置文件语法校验失败，未保存。" >&2
         return 1
     fi
-    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${TRAFFIC_STATS_MODE:-interface}" == interface || "${TRAFFIC_STATS_MODE:-interface}" == port ]]; [[ "${PROXY_PORT:-49912}" =~ ^[0-9]+$ ]] && [ "${PROXY_PORT:-49912}" -ge 1 ] && [ "${PROXY_PORT:-49912}" -le 65535 ]; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.4}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
+    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${TRAFFIC_STATS_MODE:-interface}" == interface || "${TRAFFIC_STATS_MODE:-interface}" == port ]]; valid_port_list "${PROXY_PORTS:-${PROXY_PORT:-49912}}"; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.4}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
         rm -f "$temp_file"
         echo "配置值校验失败，未保存。" >&2
         return 1
@@ -856,9 +876,6 @@ configure_one() {
             [[ "$value" == interface || "$value" == port ]] || { echo "请输入 interface 或 port。"; return 1; }
             rhs="\"$value\""
             ;;
-        PROXY_PORT)
-            [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || { echo "请输入 1 到 65535 的端口。"; return 1; }
-            ;;
         DOWNLOAD_ENABLED)
             [[ "$value" == true || "$value" == false ]] || { echo "请输入 true 或 false。"; return 1; }
             ;;
@@ -873,6 +890,61 @@ configure_one() {
         *) echo "不支持修改此配置项。"; return 1 ;;
     esac
     set_config_value "$key" "$rhs"
+}
+
+port_list_menu() {
+    local choice value index new_port old_port updated port_number
+    local -a ports
+    while true; do
+        clear 2>/dev/null || true
+        load_config
+        echo "====== 代理端口管理 ======"
+        echo "当前端口（TCP/UDP）："
+        IFS=',' read -ra ports <<< "$PROXY_PORTS"
+        for index in "${!ports[@]}"; do
+            port_number=$((index + 1))
+            printf '  %s. %s\n' "$port_number" "${ports[$index]}"
+        done
+        menu_option 1 "添加端口"
+        menu_option 2 "修改端口"
+        menu_option 3 "删除端口"
+        menu_option 4 "直接设置端口列表"
+        menu_option 0 "返回流量补充菜单"
+        echo
+        read -r -p "请选择 [0-4]: " choice
+        case "$choice" in
+            1)
+                read -r -p "输入要添加的端口：" new_port
+                [[ "$new_port" =~ ^[1-9][0-9]*$ ]] && [ "$new_port" -le 65535 ] || { echo "端口无效。"; pause_menu; continue; }
+                [[ ",$PROXY_PORTS," != *",$new_port,"* ]] || { echo "端口已存在。"; pause_menu; continue; }
+                set_config_value PROXY_PORTS "\"$PROXY_PORTS,$new_port\""; pause_menu ;;
+            2)
+                read -r -p "输入要修改的序号（1 开始）：" index
+                read -r -p "输入新的端口：" new_port
+                [[ "$index" =~ ^[1-9][0-9]*$ ]] && [[ "$new_port" =~ ^[1-9][0-9]*$ ]] && [ "$new_port" -le 65535 ] || { echo "序号或端口无效。"; pause_menu; continue; }
+                IFS=',' read -ra ports <<< "$PROXY_PORTS"
+                [ "$index" -le "${#ports[@]}" ] || { echo "序号不存在。"; pause_menu; continue; }
+                old_port="${ports[$((index - 1))]}"
+                [[ "$new_port" = "$old_port" || ",$PROXY_PORTS," != *",$new_port,"* ]] || { echo "新端口已存在。"; pause_menu; continue; }
+                ports[$((index - 1))]="$new_port"
+                updated="$(IFS=,; printf '%s' "${ports[*]}")"
+                set_config_value PROXY_PORTS "\"$updated\""; pause_menu ;;
+            3)
+                IFS=',' read -ra ports <<< "$PROXY_PORTS"
+                [ "${#ports[@]}" -gt 1 ] || { echo "至少保留一个端口。"; pause_menu; continue; }
+                read -r -p "输入要删除的序号（1 开始）：" index
+                [[ "$index" =~ ^[1-9][0-9]*$ ]] && [ "$index" -le "${#ports[@]}" ] || { echo "序号不存在。"; pause_menu; continue; }
+                unset 'ports[index-1]'
+                updated="$(IFS=,; printf '%s' "${ports[*]}")"
+                set_config_value PROXY_PORTS "\"$updated\""; pause_menu ;;
+            4)
+                read -r -p "输入逗号分隔端口列表（例如 49912,443）：" value
+                valid_port_list "$value" || { echo "端口列表无效或存在重复端口。"; pause_menu; continue; }
+                set_config_value PROXY_PORTS "\"$value\""; pause_menu ;;
+            0) return 0 ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
 }
 
 reset_traffic_stats() {
@@ -968,7 +1040,7 @@ config_submenu() {
                     echo "====== 不对等流量补充 ======"
                     menu_option 1 "自动补充开关（当前：$DOWNLOAD_ENABLED）"
                     menu_option 2 "统计模式（当前：$TRAFFIC_STATS_MODE）"
-                    menu_option 3 "代理端口（当前：$PROXY_PORT；TCP/UDP）"
+                    menu_option 3 "代理端口管理（当前：$(port_list_label)；TCP/UDP）"
                     menu_option 4 "入站/出站目标比例（当前：$DOWNLOAD_RX_FRACTION）"
                     menu_option 5 "每小时最大补充量（当前：$MAX_DOWNLOAD_BYTES_PER_HOUR bytes；0 为不限）"
                     menu_option 6 "下载速度上限（当前：$rate_mbps Mbps；0 为不限）"
@@ -978,7 +1050,7 @@ config_submenu() {
                     case "$choice" in
                         1) configure_one DOWNLOAD_ENABLED "启用自动下载补足？输入 true 或 false"; pause_menu ;;
                         2) configure_one TRAFFIC_STATS_MODE "统计模式（interface 整卡，port 代理端口）"; pause_menu ;;
-                        3) configure_one PROXY_PORT "代理监听端口（TCP/UDP）"; pause_menu ;;
+                        3) port_list_menu ;;
                         4) configure_one DOWNLOAD_RX_FRACTION "目标入站/出站比例（1.4 表示多 40%）"; pause_menu ;;
                         5) configure_one MAX_DOWNLOAD_BYTES_PER_HOUR "每小时最大下载字节数（0 为不限）"; pause_menu ;;
                         6) configure_one DOWNLOAD_RATE_LIMIT "下载限速 Mbps（40 表示 40 Mbps，0 为不限）"; pause_menu ;;

@@ -8,7 +8,7 @@
 - 默认限速方向为出站，限制整张网卡上的出站流量。
 - 当采样吞吐率低于 `5 Mbps` 并持续 `30 秒` 时，恢复到 `160 Mbps` 第一阶段。
 - 按北京时间（UTC+8）小时统计整机入站和出站字节数。
-- 支持整卡统计和代理端口统计；端口模式可统计 TCP/UDP 49912 这类固定监听端口。
+- 支持整卡统计和多个代理端口统计；端口模式可统计 TCP/UDP 49912 等固定监听端口。
 - 状态面板分别显示网卡总入站和脚本补充下载量，便于判断实际补充情况。
 - 按北京时间每月 1 日 00:00 重置月度统计，显示本月累计入站、出站、当前缺口和实际补充流量；服务重启不会清零。
 - 默认目标为：入站流量达到出站流量的 `1.4` 倍，即入站比出站多 40%。
@@ -82,7 +82,7 @@ sudo systemctl restart adaptive-traffic.service
 4. 重启服务并应用配置
 5. 查看实时 systemd 日志
 6. 查看网卡和 `tc` 限速统计
-7. 配置管理二级菜单：限速策略、恢复条件、整卡/端口统计模式、代理端口、流量补充、下载限速，以及重置小时、本月和补充统计
+7. 配置管理二级菜单：限速策略、恢复条件、整卡/端口统计模式、代理端口管理、流量补充、下载限速，以及重置小时、本月和补充统计
 8. 从 GitHub 获取最新脚本并自动重启服务
 9. 卸载服务、脚本和 `xs` 快捷命令
 
@@ -109,7 +109,7 @@ DIRECTION="egress"
 
 DOWNLOAD_ENABLED=true
 TRAFFIC_STATS_MODE="interface"
-PROXY_PORT=49912
+PROXY_PORTS="49912"
 DOWNLOAD_RX_FRACTION=1.4
 MAX_DOWNLOAD_BYTES_PER_HOUR=0
 DOWNLOAD_URL="https://mirrors.tencent.com/npm/lodash/-/lodash-4.17.21.tgz"
@@ -128,7 +128,7 @@ sudo nano /etc/adaptive-traffic/config.env
 ```bash
 DOWNLOAD_ENABLED=true
 TRAFFIC_STATS_MODE="interface"
-PROXY_PORT=49912
+PROXY_PORTS="49912"
 DOWNLOAD_RX_FRACTION=1.4
 MAX_DOWNLOAD_BYTES_PER_HOUR=0
 DOWNLOAD_URL="https://mirrors.tencent.com/npm/lodash/-/lodash-4.17.21.tgz"
@@ -145,7 +145,9 @@ DOWNLOAD_RATE_LIMIT="5000000"
 统计模式：
 
 - `TRAFFIC_STATS_MODE="interface"`：统计整张网卡。补充下载仍会计入总 RX，但面板会单独显示脚本实际下载量和扣除补充后的其他入站估算值。
-- `TRAFFIC_STATS_MODE="port"`：通过 nftables 统计代理监听端口的 TCP/UDP 客户端双向流量。代理到目标网站的连接不使用监听端口，所以脚本用客户端入站加出站，分别估算代理完整链路的入站和出站。你的代理端口为 `49912` 时设置 `PROXY_PORT=49912`。端口模式需要服务器安装 `nft`，并只适合代理确实固定使用该端口的情况；它是估算值，不等于服务商账单统计。
+- `TRAFFIC_STATS_MODE="port"`：通过 nftables 统计指定代理监听端口的 TCP/UDP 客户端双向流量。代理到目标网站的连接不使用监听端口，所以脚本用客户端入站加出站，分别估算代理完整链路的入站和出站。端口列表使用 `PROXY_PORTS="49912,443"` 这样的逗号分隔格式。端口模式需要服务器安装 `nft`，并只适合代理确实固定使用这些端口的情况；它是估算值，不等于服务商账单统计。
+
+在 `xs → 配置管理 → 不对等流量补充 → 代理端口管理` 可以添加、按序号修改、按序号删除或直接设置整个列表。至少保留一个端口，不允许重复端口；每个端口同时统计 TCP 和 UDP。保存后若服务正在运行，会自动重启应用。旧配置中的单端口 `PROXY_PORT` 会继续读取；首次通过菜单保存端口列表后，以新字段 `PROXY_PORTS` 为准。
 
 端口模式下，腾讯镜像下载不会命中代理监听端口，因此不会被计入代理业务估算值；下载补充量仍会单独计入目标计算。代理程序如果使用透明代理、NAT、额外监听端口或本机回环连接，估算可能偏离实际值，应使用整卡模式核对服务商流量。
 
