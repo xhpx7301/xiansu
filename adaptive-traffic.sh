@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.5.1"
+readonly SCRIPT_VERSION="1.6.0"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -18,6 +18,7 @@ readonly SHORTCUT_PATH="/usr/local/bin/xs"
 readonly SCRIPT_URL="https://raw.githubusercontent.com/xhpx7301/xiansu/main/adaptive-traffic.sh"
 readonly DOWNLOAD_CHECK_INTERVAL_SECONDS=3600
 readonly DISPLAY_TZ="Asia/Shanghai"
+readonly NFT_STATS_TABLE="xs_traffic_stats"
 COLOR_OUTPUT=0
 RUN_IFACE=''
 
@@ -47,6 +48,10 @@ RECOVERY_SECONDS=30
 DIRECTION="egress"
 # 是否按小时补充入站流量。默认开启；false 时只统计和限速
 DOWNLOAD_ENABLED=true
+# 统计模式：interface 整卡；port 只统计代理端口的 TCP/UDP 流量
+TRAFFIC_STATS_MODE="interface"
+# 代理监听端口；端口模式使用该端口统计 TCP/UDP
+PROXY_PORT=49912
 # 目标为：每小时入站比出站多 40%，即入站至少达到出站的 1.4 倍
 DOWNLOAD_RX_FRACTION=1.4
 # 每小时下载上限，0 表示不设上限；不设上限才能在高流量时完成 1.4 倍目标
@@ -67,6 +72,8 @@ EOF
     RECOVERY_RATE_MBPS="${RECOVERY_RATE_MBPS:-5}"
     RECOVERY_SECONDS="${RECOVERY_SECONDS:-30}"
     DIRECTION="${DIRECTION:-egress}"
+    TRAFFIC_STATS_MODE="${TRAFFIC_STATS_MODE:-interface}"
+    PROXY_PORT="${PROXY_PORT:-49912}"
     DOWNLOAD_ENABLED="${DOWNLOAD_ENABLED:-true}"
     DOWNLOAD_RX_FRACTION="${DOWNLOAD_RX_FRACTION:-1.4}"
     MAX_DOWNLOAD_BYTES_PER_HOUR="${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}"
@@ -77,6 +84,9 @@ EOF
 
 validate_config() {
     [[ "$DIRECTION" == egress || "$DIRECTION" == both ]] || die "DIRECTION 必须是 egress 或 both"
+    [[ "$TRAFFIC_STATS_MODE" == interface || "$TRAFFIC_STATS_MODE" == port ]] || die "TRAFFIC_STATS_MODE 必须是 interface 或 port"
+    [[ "$PROXY_PORT" =~ ^[0-9]+$ ]] && [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ] || die "PROXY_PORT 必须是 1 到 65535 的端口"
+    [ "$TRAFFIC_STATS_MODE" != port ] || have nft || die "端口统计模式需要 nftables（nft 命令）"
     [[ "$RECOVERY_SECONDS" =~ ^[0-9]+$ ]] || die "RECOVERY_SECONDS 必须是整数"
     [ "$RECOVERY_SECONDS" -gt 0 ] || die "RECOVERY_SECONDS 必须大于 0"
     awk -v x="$RECOVERY_RATE_MBPS" 'BEGIN { exit !(x >= 0) }' || die "RECOVERY_RATE_MBPS 必须是非负数"
@@ -107,6 +117,47 @@ detect_iface() {
 read_counters() {
     local iface="$1"
     awk -v dev="$iface:" '$1 == dev {print $2, $10; found=1} END {if (!found) print "0 0"}' /proc/net/dev
+}
+
+setup_port_counters() {
+    local iface="$1"
+    nft list table inet "$NFT_STATS_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_STATS_TABLE"
+    nft list counter inet "$NFT_STATS_TABLE" proxy_rx >/dev/null 2>&1 || nft add counter inet "$NFT_STATS_TABLE" proxy_rx
+    nft list counter inet "$NFT_STATS_TABLE" proxy_tx >/dev/null 2>&1 || nft add counter inet "$NFT_STATS_TABLE" proxy_tx
+    nft list chain inet "$NFT_STATS_TABLE" input >/dev/null 2>&1 || nft add chain inet "$NFT_STATS_TABLE" input '{ type filter hook input priority 0; policy accept; }'
+    nft list chain inet "$NFT_STATS_TABLE" output >/dev/null 2>&1 || nft add chain inet "$NFT_STATS_TABLE" output '{ type filter hook output priority 0; policy accept; }'
+    nft flush chain inet "$NFT_STATS_TABLE" input
+    nft flush chain inet "$NFT_STATS_TABLE" output
+    nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" tcp dport "$PROXY_PORT" counter name proxy_rx
+    nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" udp dport "$PROXY_PORT" counter name proxy_rx
+    nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" tcp sport "$PROXY_PORT" counter name proxy_tx
+    nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" udp sport "$PROXY_PORT" counter name proxy_tx
+}
+
+read_port_counter() {
+    local name="$1" value
+    value="$(nft list counter inet "$NFT_STATS_TABLE" "$name" 2>/dev/null | awk '{for (i=1; i<NF; i++) if ($i == "bytes") {print $(i+1); exit}}')"
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$value"
+}
+
+read_stats_counters() {
+    local iface="$1"
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then
+        local port_rx port_tx estimated
+        port_rx="$(read_port_counter proxy_rx)" || return 1
+        port_tx="$(read_port_counter proxy_tx)" || return 1
+        # 代理转发的远端连接不使用监听端口。客户端双向字节之和近似代理完整链路的各方向流量。
+        estimated=$((port_rx + port_tx))
+        printf '%s %s\n' "$estimated" "$estimated"
+    else
+        read_counters "$iface"
+    fi
+}
+
+stats_identity() {
+    local iface="$1"
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then printf 'port:%s:%s' "$iface" "$PROXY_PORT"; else printf 'interface:%s' "$iface"; fi
 }
 
 rate_to_tc() {
@@ -235,7 +286,7 @@ beijing_date() {
 
 show_dashboard() {
     load_config
-    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx month_target month_gap month_download_bytes month_checks month_start_epoch month_start_time
+    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx business_hour_rx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx business_month_rx month_target month_gap month_download_bytes hour_download_bytes month_checks month_start_epoch month_start_time stats_label effective_hour_rx effective_month_rx
     local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
@@ -251,10 +302,14 @@ show_dashboard() {
     beijing_now="$(beijing_date '+%Y-%m-%d %H:%M:%S')"
     state_hour="$(state_get HOUR 0)"
     state_month="$(state_get MONTH 0)"
-    IFS=' ' read -r rx tx <<< "$(read_counters "$iface" 2>/dev/null || printf '0 0')"
+    IFS=' ' read -r rx tx <<< "$(read_stats_counters "$iface" 2>/dev/null || printf '0 0')"
     rx="${rx:-0}"; tx="${tx:-0}"
     rx_base="$(state_get HOUR_START_RX 0)"
     tx_base="$(state_get HOUR_START_TX 0)"
+    hour_download_bytes="$(state_get HOUR_DOWNLOAD_BYTES 0)"
+    month_download_bytes="$(state_get MONTH_DOWNLOAD_BYTES 0)"
+    [[ "$hour_download_bytes" =~ ^[0-9]+$ ]] || hour_download_bytes=0
+    [[ "$month_download_bytes" =~ ^[0-9]+$ ]] || month_download_bytes=0
     if [ "$state_hour" = "$hour" ]; then
         hour_rx=$((rx - rx_base)); hour_tx=$((tx - tx_base))
         [ "$hour_rx" -ge 0 ] || hour_rx=0
@@ -271,12 +326,23 @@ show_dashboard() {
     else
         month_rx=0; month_tx=0
     fi
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then
+        stats_label="代理端口估算 TCP/UDP $PROXY_PORT"
+        business_hour_rx="$hour_rx"; business_month_rx="$month_rx"
+        effective_hour_rx=$((hour_rx + hour_download_bytes))
+        effective_month_rx=$((month_rx + month_download_bytes))
+    else
+        stats_label="整卡 $iface"
+        business_hour_rx=$((hour_rx - hour_download_bytes)); [ "$business_hour_rx" -ge 0 ] || business_hour_rx=0
+        business_month_rx=$((month_rx - month_download_bytes)); [ "$business_month_rx" -ge 0 ] || business_month_rx=0
+        effective_hour_rx="$hour_rx"; effective_month_rx="$month_rx"
+    fi
     month_target="$(awk -v tx="$month_tx" -v fraction="$DOWNLOAD_RX_FRACTION" 'BEGIN {printf "%.0f", tx*fraction}')"
-    month_gap=$((month_target - month_rx)); [ "$month_gap" -gt 0 ] || month_gap=0
+    month_gap=$((month_target - effective_month_rx)); [ "$month_gap" -gt 0 ] || month_gap=0
     target="$(awk -v tx="$hour_tx" -v fraction="$DOWNLOAD_RX_FRACTION" 'BEGIN {printf "%.0f", tx*fraction}')"
-    gap=$((target - hour_rx)); [ "$gap" -gt 0 ] || gap=0
+    gap=$((target - effective_hour_rx)); [ "$gap" -gt 0 ] || gap=0
     if [ "$hour_tx" -gt 0 ]; then
-        ratio="$(awk -v rx="$hour_rx" -v tx="$hour_tx" 'BEGIN {printf "%.1f%%", rx/tx*100}')"
+        ratio="$(awk -v rx="$effective_hour_rx" -v tx="$hour_tx" 'BEGIN {printf "%.1f%%", rx/tx*100}')"
     else
         ratio="--"
     fi
@@ -288,7 +354,6 @@ show_dashboard() {
     download_last_check="$(state_get DOWNLOAD_LAST_CHECK_EPOCH 0)"
     download_next_check="$(state_get DOWNLOAD_NEXT_CHECK_EPOCH 0)"
     download_total_bytes="$(state_get DOWNLOAD_TOTAL_BYTES 0)"
-    month_download_bytes="$(state_get MONTH_DOWNLOAD_BYTES 0)"
     month_checks="$(state_get MONTH_DOWNLOAD_CHECKS 0)"
     month_start_epoch="$(state_get MONTH_START_EPOCH 0)"
     month_start_time="$(format_full_time "$month_start_epoch")"
@@ -311,33 +376,46 @@ show_dashboard() {
     printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前时间 (北京时间)：%s%s%s\n' \
         "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$beijing_now" "$reset"
     printf '%s本小时累计（北京时间）：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
-        "$dim" "$cyan" "$iface" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
+        "$dim" "$cyan" "$stats_label" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
+    printf '入站拆分：%s %s | 补充下载 %s | 合计用于目标 %s\n' \
+        "$(if [ "$TRAFFIC_STATS_MODE" = port ]; then printf '代理入站估算'; else printf '其他入站约'; fi)" "$(format_bytes "$business_hour_rx")" "$(format_bytes "$hour_download_bytes")" "$(format_bytes "$effective_hour_rx")"
     printf '当前小时目标：出站 × %s%s%s = %s%s%s | 当前小时缺口：%s%s%s\n' \
         "$yellow" "$DOWNLOAD_RX_FRACTION" "$reset" "$green" "$(format_bytes "$target")" "$reset" "$gap_color" "$(format_bytes "$gap")" "$reset"
     printf '补充下载：%s%s%s | 速率上限：%s%s Mbps%s | 来源：%s腾讯镜像%s\n' \
         "$download_color" "$download_state" "$reset" "$yellow" "$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.1f", bytes*8/1000000; else printf "不限速"}')" "$reset" "$blue" "$reset"
     printf '补充记录：%s%s%s | 检查缺口：%s | 本次：%s%s%s | 上次：%s | 下次：%s | 累计：%s\n' \
         "$download_color" "$download_status" "$reset" "$(format_bytes "$download_last_deficit")" "$cyan" "$(format_bytes "$download_last_bytes")" "$reset" "$(format_time "$download_last_check")" "$(format_time "$download_next_check")" "$(format_bytes "$download_total_bytes")"
-    printf '本月累计（北京时间）：入站 %s | 出站 %s | 目标入站 %s\n' \
+    printf '本月累计（北京时间）：统计入站 %s | 出站 %s | 目标入站 %s\n' \
         "$(format_bytes "$month_rx")" "$(format_bytes "$month_tx")" "$(format_bytes "$month_target")"
+    printf '本月入站拆分：%s %s | 补充下载 %s | 合计用于目标 %s\n' \
+        "$(if [ "$TRAFFIC_STATS_MODE" = port ]; then printf '代理入站估算'; else printf '其他入站约'; fi)" "$(format_bytes "$business_month_rx")" "$(format_bytes "$month_download_bytes")" "$(format_bytes "$effective_month_rx")"
     printf '统计起始时间：%s | 本月累计缺口：%s | 已补充：%s | 检查 %s 次\n' \
         "$month_start_time" "$(format_bytes "$month_gap")" "$(format_bytes "$month_download_bytes")" "$month_checks"
     printf '%s------------------------------------------------------------%s\n' "$dim" "$reset"
 }
 
 download_deficit() {
-    local rx="$2" tx="$3" baseline_rx baseline_tx hour_rx hour_tx target deficit
+    local rx="$2" tx="$3" baseline_rx baseline_tx hour_rx hour_tx target deficit hour_download_bytes remaining_cap
     baseline_rx="$(state_get HOUR_START_RX 0)"; baseline_tx="$(state_get HOUR_START_TX 0)"
     hour_rx=$((rx - baseline_rx)); hour_tx=$((tx - baseline_tx))
     [ "$hour_rx" -ge 0 ] || hour_rx=0; [ "$hour_tx" -ge 0 ] || hour_tx=0
+    hour_download_bytes="$(state_get HOUR_DOWNLOAD_BYTES 0)"
+    [[ "$hour_download_bytes" =~ ^[0-9]+$ ]] || hour_download_bytes=0
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then
+        hour_rx=$((hour_rx + hour_download_bytes))
+    fi
     target="$(awk -v tx="$hour_tx" -v fraction="$DOWNLOAD_RX_FRACTION" 'BEGIN {printf "%.0f", tx*fraction}')"
     deficit=$((target - hour_rx)); [ "$deficit" -gt 0 ] || deficit=0
-    if [ "$MAX_DOWNLOAD_BYTES_PER_HOUR" -gt 0 ] && [ "$deficit" -gt "$MAX_DOWNLOAD_BYTES_PER_HOUR" ]; then deficit="$MAX_DOWNLOAD_BYTES_PER_HOUR"; fi
+    if [ "$MAX_DOWNLOAD_BYTES_PER_HOUR" -gt 0 ]; then
+        remaining_cap=$((MAX_DOWNLOAD_BYTES_PER_HOUR - hour_download_bytes))
+        [ "$remaining_cap" -ge 0 ] || remaining_cap=0
+        [ "$deficit" -le "$remaining_cap" ] || deficit="$remaining_cap"
+    fi
     printf '%s' "$deficit"
 }
 
 download_until_target() {
-    local iface="$1" hour="$2" rx="$3" tx="$4" deficit initial_deficit before after got remaining curl_args downloaded=0 status now total_downloaded month_downloaded month_check_count
+    local iface="$1" hour="$2" rx="$3" tx="$4" deficit initial_deficit got remaining curl_args received curl_ok downloaded=0 status now total_downloaded month_downloaded hour_downloaded month_check_count
     now="$(date +%s)"
     state_set DOWNLOAD_LAST_CHECK_EPOCH "$now"
     state_set DOWNLOAD_LAST_CHECK_HOUR "$hour"
@@ -357,31 +435,34 @@ download_until_target() {
     fi
     log "小时目标缺口：${deficit} bytes，开始下载：$DOWNLOAD_URL"
     state_set DOWNLOAD_LAST_STATUS 下载中
-    before="$(read_counters "$iface" | awk '{print $1}')"
-    curl_args=(-fL --retry 2 --connect-timeout 15 --max-time "$DOWNLOAD_TIMEOUT_SECONDS" -sS)
+    curl_args=(-fL --retry 2 --connect-timeout 15 --max-time "$DOWNLOAD_TIMEOUT_SECONDS" -sS -w '%{size_download}')
     [ -n "$DOWNLOAD_RATE_LIMIT" ] && curl_args+=(--limit-rate "$DOWNLOAD_RATE_LIMIT")
-    # 重复请求，直到网卡收到的字节数达到缺口或 curl 失败。
+    # 用 curl 实际收到的文件字节数记录补充下载，避免把并发业务 RX 算作补充。
     while [ "$deficit" -gt 0 ]; do
-        if ! curl "${curl_args[@]}" "$DOWNLOAD_URL" -o /dev/null; then
+        if received="$(curl "${curl_args[@]}" "$DOWNLOAD_URL" -o /dev/null)"; then curl_ok=1; else curl_ok=0; fi
+        got="$(awk -v bytes="${received:-0}" 'BEGIN {printf "%.0f", bytes}')"
+        if [ "$got" -gt 0 ]; then
+            downloaded=$((downloaded + got))
+            remaining=$((deficit - got)); deficit="$remaining"
+        fi
+        if [ "$curl_ok" -eq 0 ]; then
             log "下载失败，下一小时重试"
             state_set DOWNLOAD_LAST_STATUS 失败
             break
         fi
-        after="$(read_counters "$iface" | awk '{print $1}')"
-        got=$((after - before)); [ "$got" -ge 0 ] || got=0
         [ "$got" -gt 0 ] || break
-        downloaded=$((downloaded + got))
-        remaining=$((deficit - got)); deficit="$remaining"
-        before="$after"
         [ "$deficit" -gt 0 ] || break
     done
     total_downloaded="$(state_get DOWNLOAD_TOTAL_BYTES 0)"
     [[ "$total_downloaded" =~ ^[0-9]+$ ]] || total_downloaded=0
     month_downloaded="$(state_get MONTH_DOWNLOAD_BYTES 0)"
     [[ "$month_downloaded" =~ ^[0-9]+$ ]] || month_downloaded=0
+    hour_downloaded="$(state_get HOUR_DOWNLOAD_BYTES 0)"
+    [[ "$hour_downloaded" =~ ^[0-9]+$ ]] || hour_downloaded=0
     state_set DOWNLOAD_LAST_BYTES "$downloaded"
     state_set DOWNLOAD_TOTAL_BYTES "$((total_downloaded + downloaded))"
     state_set MONTH_DOWNLOAD_BYTES "$((month_downloaded + downloaded))"
+    state_set HOUR_DOWNLOAD_BYTES "$((hour_downloaded + downloaded))"
     state_set DOWNLOAD_LAST_FINISHED_EPOCH "$(date +%s)"
     if [ "$deficit" -le 0 ]; then
         status=已完成
@@ -400,20 +481,22 @@ run() {
     have awk || die "缺少 awk"
     have curl || die "缺少 curl"
     load_config; validate_config
-    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx rx tx delta sample_mbps hour month state_hour state_month now hour_start_epoch last_download_check last_state_seconds=-1 process_initialized=0
+    local iface elapsed=0 low_rate_seconds=0 current_rate="" prev_rx prev_tx raw_rx raw_tx rx tx delta sample_mbps hour month state_hour state_month now hour_start_epoch last_download_check last_state_seconds=-1 process_initialized=0 identity saved_identity
     last_download_check="$(date +%s)"
     iface="$(detect_iface)"; [ -n "$iface" ] || die "无法检测默认路由网卡"
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then setup_port_counters "$iface"; fi
     RUN_IFACE="$iface"
     echo "$$" > "$PID_FILE"
     trap cleanup_run EXIT
     trap 'exit 0' INT TERM
     IFS=' ' read -r prev_rx prev_tx <<< "$(read_counters "$iface")"
     prev_rx="${prev_rx:-0}"; prev_tx="${prev_tx:-0}"
-    log "启动 v$SCRIPT_VERSION，网卡=$iface，方向=$DIRECTION，阶段=$RATE_STAGES"
+    identity="$(stats_identity "$iface")"
+    log "启动 v$SCRIPT_VERSION，网卡=$iface，统计=$identity，方向=$DIRECTION，阶段=$RATE_STAGES"
     while :; do
-        IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
-        rx="${rx:-0}"; tx="${tx:-0}"
-        delta=$(( (rx - prev_rx) + (tx - prev_tx) )); [ "$delta" -ge 0 ] || delta=0
+        IFS=' ' read -r raw_rx raw_tx <<< "$(read_counters "$iface")"
+        raw_rx="${raw_rx:-0}"; raw_tx="${raw_tx:-0}"
+        delta=$(( (raw_rx - prev_rx) + (raw_tx - prev_tx) )); [ "$delta" -ge 0 ] || delta=0
         sample_mbps="$(awk -v bytes="$delta" 'BEGIN {printf "%.6f", bytes*8/1000000}')"
         if awk -v sample="$sample_mbps" -v threshold="$RECOVERY_RATE_MBPS" 'BEGIN {exit !(sample < threshold)}'; then
             low_rate_seconds=$((low_rate_seconds + 1))
@@ -442,8 +525,21 @@ run() {
         now="$(date +%s)"
         hour="$(beijing_date +%Y%m%d%H)"
         month="$(beijing_date +%Y%m)"
+        IFS=' ' read -r rx tx <<< "$(read_stats_counters "$iface")"
+        rx="${rx:-0}"; tx="${tx:-0}"
         state_hour="$(state_get HOUR 0)"
         state_month="$(state_get MONTH 0)"
+        saved_identity="$(state_get STATS_IDENTITY '')"
+        if [ "$saved_identity" != "$identity" ] || { [ "$state_month" = "$month" ] && { [ "$rx" -lt "$(state_get MONTH_START_RX 0)" ] || [ "$tx" -lt "$(state_get MONTH_START_TX 0)" ]; }; }; then
+            state_set STATS_IDENTITY "$identity"
+            state_set MONTH "$month"; state_set MONTH_START_RX "$rx"; state_set MONTH_START_TX "$tx"; state_set MONTH_START_EPOCH "$now"; state_set MONTH_DOWNLOAD_BYTES 0; state_set MONTH_DOWNLOAD_CHECKS 0
+            state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"; state_set HOUR_DOWNLOAD_BYTES 0
+            state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
+            state_set DOWNLOAD_LAST_CHECK_HOUR ''
+            last_download_check="$now"
+            state_month="$month"; state_hour="$hour"
+            log "统计来源变更或计数器重置，重新建立基线：$identity"
+        fi
         if [ "$process_initialized" -eq 0 ]; then
             if [ "$state_month" != "$month" ]; then
                 state_set MONTH "$month"; state_set MONTH_START_RX "$rx"; state_set MONTH_START_TX "$tx"; state_set MONTH_START_EPOCH "$now"; state_set MONTH_DOWNLOAD_BYTES 0; state_set MONTH_DOWNLOAD_CHECKS 0
@@ -451,11 +547,19 @@ run() {
             fi
             if [ "$state_hour" != "$hour" ]; then
                 state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
+                state_set HOUR_DOWNLOAD_BYTES 0
                 state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
                 last_download_check="$now"
                 log "开始统计北京时间小时 $hour，基线 rx=$rx tx=$tx"
             else
                 local saved_next_check
+                if [ -z "$(state_get HOUR_DOWNLOAD_BYTES '')" ]; then
+                    if [ "$(state_get DOWNLOAD_LAST_CHECK_HOUR '')" = "$hour" ]; then
+                        state_set HOUR_DOWNLOAD_BYTES "$(state_get DOWNLOAD_LAST_BYTES 0)"
+                    else
+                        state_set HOUR_DOWNLOAD_BYTES 0
+                    fi
+                fi
                 saved_next_check="$(state_get DOWNLOAD_NEXT_CHECK_EPOCH 0)"
                 if [[ "$saved_next_check" =~ ^[0-9]+$ ]] && [ "$saved_next_check" -gt 0 ]; then
                     last_download_check="$((saved_next_check - DOWNLOAD_CHECK_INTERVAL_SECONDS))"
@@ -475,25 +579,28 @@ run() {
                 hour_start_epoch="$(state_get HOUR_START_EPOCH 0)"
                 if [ "$DOWNLOAD_ENABLED" = true ] && [ "$state_hour" != 0 ] && [ "$state_hour" != "$(state_get DOWNLOAD_LAST_CHECK_HOUR '')" ] && [[ "$hour_start_epoch" =~ ^[0-9]+$ ]] && [ $((now - hour_start_epoch)) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
                     download_until_target "$iface" "$state_hour" "$rx" "$tx"
-                    IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+                    IFS=' ' read -r rx tx <<< "$(read_stats_counters "$iface")"
                     rx="${rx:-0}"; tx="${tx:-0}"
-                    prev_rx="$rx"; prev_tx="$tx"
+                    IFS=' ' read -r prev_rx prev_tx <<< "$(read_counters "$iface")"
+                    raw_rx="$prev_rx"; raw_tx="$prev_tx"
                     now="$(date +%s)"
                 fi
                 state_set HOUR "$hour"; state_set HOUR_START_RX "$rx"; state_set HOUR_START_TX "$tx"; state_set HOUR_START_EPOCH "$now"
+                state_set HOUR_DOWNLOAD_BYTES 0
                 state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((now + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
                 last_download_check="$now"
                 log "开始统计北京时间小时 $hour，基线 rx=$rx tx=$tx"
             elif [ "$DOWNLOAD_ENABLED" = true ] && [ $((now - last_download_check)) -ge "$DOWNLOAD_CHECK_INTERVAL_SECONDS" ]; then
                 download_until_target "$iface" "$hour" "$rx" "$tx"
-                IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+                IFS=' ' read -r rx tx <<< "$(read_stats_counters "$iface")"
                 rx="${rx:-0}"; tx="${tx:-0}"
-                prev_rx="$rx"; prev_tx="$tx"
+                IFS=' ' read -r prev_rx prev_tx <<< "$(read_counters "$iface")"
+                raw_rx="$prev_rx"; raw_tx="$prev_tx"
                 last_download_check="$(date +%s)"
                 state_set DOWNLOAD_NEXT_CHECK_EPOCH "$((last_download_check + DOWNLOAD_CHECK_INTERVAL_SECONDS))"
             fi
         fi
-        prev_rx="$rx"; prev_tx="$tx"
+        if [ "$TRAFFIC_STATS_MODE" = interface ]; then prev_rx="$rx"; prev_tx="$tx"; else prev_rx="$raw_rx"; prev_tx="$raw_tx"; fi
         sleep 1
     done
 }
@@ -692,7 +799,7 @@ set_config_value() {
         echo "配置文件语法校验失败，未保存。" >&2
         return 1
     fi
-    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.4}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
+    if ! (set -a; . "$temp_file"; set +a; [[ "${DIRECTION:-egress}" == egress || "${DIRECTION:-egress}" == both ]]; [[ "${TRAFFIC_STATS_MODE:-interface}" == interface || "${TRAFFIC_STATS_MODE:-interface}" == port ]]; [[ "${PROXY_PORT:-49912}" =~ ^[0-9]+$ ]] && [ "${PROXY_PORT:-49912}" -ge 1 ] && [ "${PROXY_PORT:-49912}" -le 65535 ]; [[ "${RECOVERY_SECONDS:-30}" =~ ^[0-9]+$ ]] && [ "${RECOVERY_SECONDS:-30}" -gt 0 ]; [[ "${MAX_DOWNLOAD_BYTES_PER_HOUR:-0}" =~ ^[0-9]+$ ]]; [[ "${DOWNLOAD_ENABLED:-true}" == true || "${DOWNLOAD_ENABLED:-true}" == false ]]; awk -v x="${RECOVERY_RATE_MBPS:-5}" 'BEGIN {exit !(x >= 0)}'; awk -v x="${DOWNLOAD_RX_FRACTION:-1.4}" 'BEGIN {exit !(x >= 0 && x <= 10)}'; [ -n "${DOWNLOAD_URL:-}" ] || [ "${DOWNLOAD_ENABLED:-true}" != true ]); then
         rm -f "$temp_file"
         echo "配置值校验失败，未保存。" >&2
         return 1
@@ -745,6 +852,13 @@ configure_one() {
             [[ "$value" == egress || "$value" == both ]] || { echo "请输入 egress 或 both。"; return 1; }
             rhs="\"$value\""
             ;;
+        TRAFFIC_STATS_MODE)
+            [[ "$value" == interface || "$value" == port ]] || { echo "请输入 interface 或 port。"; return 1; }
+            rhs="\"$value\""
+            ;;
+        PROXY_PORT)
+            [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || { echo "请输入 1 到 65535 的端口。"; return 1; }
+            ;;
         DOWNLOAD_ENABLED)
             [[ "$value" == true || "$value" == false ]] || { echo "请输入 true 或 false。"; return 1; }
             ;;
@@ -774,7 +888,8 @@ reset_traffic_stats() {
         was_active=1
         systemctl stop adaptive-traffic.service || { echo "停止服务失败，未重置统计。"; return 1; }
     fi
-    IFS=' ' read -r rx tx <<< "$(read_counters "$iface")"
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then setup_port_counters "$iface"; fi
+    IFS=' ' read -r rx tx <<< "$(read_stats_counters "$iface")"
     rx="${rx:-0}"; tx="${tx:-0}"
     now="$(date +%s)"
     hour="$(beijing_date +%Y%m%d%H)"
@@ -789,6 +904,8 @@ reset_traffic_stats() {
     state_set HOUR_START_RX "$rx"
     state_set HOUR_START_TX "$tx"
     state_set HOUR_START_EPOCH "$now"
+    state_set HOUR_DOWNLOAD_BYTES 0
+    state_set STATS_IDENTITY "$(stats_identity "$iface")"
     state_set DOWNLOAD_LAST_STATUS 未检查
     state_set DOWNLOAD_LAST_DEFICIT_BYTES 0
     state_set DOWNLOAD_LAST_BYTES 0
@@ -850,18 +967,22 @@ config_submenu() {
                     rate_mbps="$(awk -v bytes="${DOWNLOAD_RATE_LIMIT:-0}" 'BEGIN {if (bytes > 0) printf "%.2f", bytes*8/1000000; else printf "0 (不限速)"}')"
                     echo "====== 不对等流量补充 ======"
                     menu_option 1 "自动补充开关（当前：$DOWNLOAD_ENABLED）"
-                    menu_option 2 "入站/出站目标比例（当前：$DOWNLOAD_RX_FRACTION）"
-                    menu_option 3 "每小时最大补充量（当前：$MAX_DOWNLOAD_BYTES_PER_HOUR bytes；0 为不限）"
-                    menu_option 4 "下载速度上限（当前：$rate_mbps Mbps；0 为不限）"
-                    menu_option 5 "腾讯镜像下载 URL"
+                    menu_option 2 "统计模式（当前：$TRAFFIC_STATS_MODE）"
+                    menu_option 3 "代理端口（当前：$PROXY_PORT；TCP/UDP）"
+                    menu_option 4 "入站/出站目标比例（当前：$DOWNLOAD_RX_FRACTION）"
+                    menu_option 5 "每小时最大补充量（当前：$MAX_DOWNLOAD_BYTES_PER_HOUR bytes；0 为不限）"
+                    menu_option 6 "下载速度上限（当前：$rate_mbps Mbps；0 为不限）"
+                    menu_option 7 "腾讯镜像下载 URL"
                     menu_option 0 "返回配置菜单"
-                    read -r -p "请选择 [0-5]: " choice
+                    read -r -p "请选择 [0-7]: " choice
                     case "$choice" in
                         1) configure_one DOWNLOAD_ENABLED "启用自动下载补足？输入 true 或 false"; pause_menu ;;
-                        2) configure_one DOWNLOAD_RX_FRACTION "目标入站/出站比例（1.4 表示多 40%）"; pause_menu ;;
-                        3) configure_one MAX_DOWNLOAD_BYTES_PER_HOUR "每小时最大下载字节数（0 为不限）"; pause_menu ;;
-                        4) configure_one DOWNLOAD_RATE_LIMIT "下载限速 Mbps（40 表示 40 Mbps，0 为不限）"; pause_menu ;;
-                        5) configure_one DOWNLOAD_URL "下载 URL"; pause_menu ;;
+                        2) configure_one TRAFFIC_STATS_MODE "统计模式（interface 整卡，port 代理端口）"; pause_menu ;;
+                        3) configure_one PROXY_PORT "代理监听端口（TCP/UDP）"; pause_menu ;;
+                        4) configure_one DOWNLOAD_RX_FRACTION "目标入站/出站比例（1.4 表示多 40%）"; pause_menu ;;
+                        5) configure_one MAX_DOWNLOAD_BYTES_PER_HOUR "每小时最大下载字节数（0 为不限）"; pause_menu ;;
+                        6) configure_one DOWNLOAD_RATE_LIMIT "下载限速 Mbps（40 表示 40 Mbps，0 为不限）"; pause_menu ;;
+                        7) configure_one DOWNLOAD_URL "下载 URL"; pause_menu ;;
                         0) break ;;
                         *) echo "无效选项"; sleep 1 ;;
                     esac
