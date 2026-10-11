@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.6.2"
+readonly SCRIPT_VERSION="1.6.3"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -306,7 +306,7 @@ beijing_date() {
 
 show_dashboard() {
     load_config
-    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx business_hour_rx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx business_month_rx month_target month_gap month_download_bytes hour_download_bytes month_checks month_start_epoch month_start_time stats_label effective_hour_rx effective_month_rx
+    local iface service_state hour month beijing_now state_hour state_month rx_base tx_base rx tx hour_rx hour_tx business_hour_rx target gap ratio rate rate_label active_seconds download_state direction_text service_color download_color gap_color download_status download_last_deficit download_last_bytes download_last_check download_next_check download_total_bytes month_rx_base month_tx_base month_rx month_tx business_month_rx month_target month_gap month_download_bytes hour_download_bytes month_checks month_start_epoch month_start_time effective_hour_rx effective_month_rx
     local blue='' green='' yellow='' cyan='' dim='' reset=''
     if [ "$COLOR_OUTPUT" -eq 1 ] || [ -t 1 ]; then
         blue=$'\033[94m'; green=$'\033[92m'; yellow=$'\033[93m'; cyan=$'\033[96m'
@@ -347,12 +347,10 @@ show_dashboard() {
         month_rx=0; month_tx=0
     fi
     if [ "$TRAFFIC_STATS_MODE" = port ]; then
-        stats_label="代理端口估算 TCP/UDP $(port_list_label)"
         business_hour_rx="$hour_rx"; business_month_rx="$month_rx"
         effective_hour_rx=$((hour_rx + hour_download_bytes))
         effective_month_rx=$((month_rx + month_download_bytes))
     else
-        stats_label="整卡 $iface"
         business_hour_rx=$((hour_rx - hour_download_bytes)); [ "$business_hour_rx" -ge 0 ] || business_hour_rx=0
         business_month_rx=$((month_rx - month_download_bytes)); [ "$business_month_rx" -ge 0 ] || business_month_rx=0
         effective_hour_rx="$hour_rx"; effective_month_rx="$month_rx"
@@ -390,13 +388,19 @@ show_dashboard() {
     printf '%s=== 自适应限速与流量管理 v%s ===%s\n' "$blue" "$SCRIPT_VERSION" "$reset"
     printf '%s服务：%s%-10s%s | 网卡：%s%-12s%s | 限速方向：%s%s%s\n' \
         "$dim" "$service_color" "$service_state" "$reset" "$cyan" "$iface" "$reset" "$yellow" "$direction_text" "$reset"
+    if [ "$TRAFFIC_STATS_MODE" = port ]; then
+        printf '流量统计模式：%s代理端口统计（估算）%s\n' "$cyan" "$reset"
+        printf '统计端口（TCP/UDP）：%s%s%s\n' "$blue" "$(port_list_label)" "$reset"
+    else
+        printf '流量统计模式：%s整卡统计%s\n' "$cyan" "$reset"
+    fi
     printf '当前限速：%s%s%s | 活跃计时：%s%ss%s\n' \
         "$yellow" "$rate_label" "$reset" "$yellow" "$active_seconds" "$reset"
     printf '限速阶段：%s%s%s\n' "$cyan" "$(format_rate_stages)" "$reset"
     printf '恢复条件：低于 %s%s Mbps%s 持续 %s%s 秒%s | 当前时间 (北京时间)：%s%s%s\n' \
         "$yellow" "$RECOVERY_RATE_MBPS" "$reset" "$yellow" "$RECOVERY_SECONDS" "$reset" "$cyan" "$beijing_now" "$reset"
-    printf '%s本小时累计（北京时间）：%s%s%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
-        "$dim" "$cyan" "$stats_label" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
+    printf '%s本小时累计（北京时间）%s | 入站(RX)：%s%s%s | 出站(TX)：%s%s%s | 入/出：%s%s%s\n' \
+        "$dim" "$reset" "$cyan" "$(format_bytes "$hour_rx")" "$reset" "$yellow" "$(format_bytes "$hour_tx")" "$reset" "$green" "$ratio" "$reset"
     printf '入站拆分：%s %s | 补充下载 %s | 合计用于目标 %s\n' \
         "$(if [ "$TRAFFIC_STATS_MODE" = port ]; then printf '代理入站估算'; else printf '其他入站约'; fi)" "$(format_bytes "$business_hour_rx")" "$(format_bytes "$hour_download_bytes")" "$(format_bytes "$effective_hour_rx")"
     printf '当前小时目标：出站 × %s%s%s = %s%s%s | 当前小时缺口：%s%s%s\n' \
