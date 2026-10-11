@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VERSION="1.6.1"
+readonly SCRIPT_VERSION="1.6.2"
 readonly CONFIG_DIR="/etc/adaptive-traffic"
 readonly CONFIG_FILE="$CONFIG_DIR/config.env"
 readonly STATE_FILE="$CONFIG_DIR/state.env"
@@ -147,10 +147,10 @@ setup_port_counters() {
     nft flush chain inet "$NFT_STATS_TABLE" input
     nft flush chain inet "$NFT_STATS_TABLE" output
     for port in "${ports[@]}"; do
-        nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" tcp dport "$port" counter name proxy_rx
-        nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" udp dport "$port" counter name proxy_rx
-        nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" tcp sport "$port" counter name proxy_tx
-        nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" udp sport "$port" counter name proxy_tx
+        nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" tcp dport "$port" ct direction original counter name proxy_rx
+        nft add rule inet "$NFT_STATS_TABLE" input iifname "$iface" udp dport "$port" ct direction original counter name proxy_rx
+        nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" tcp sport "$port" ct direction reply counter name proxy_tx
+        nft add rule inet "$NFT_STATS_TABLE" output oifname "$iface" udp sport "$port" ct direction reply counter name proxy_tx
     done
 }
 
